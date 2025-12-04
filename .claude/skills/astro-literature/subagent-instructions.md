@@ -101,21 +101,32 @@ For each paper that cites this paper, classify the relationship.
 
    Look for: "however", "in contrast", "unlike", "does not support", "tension with"
 
-3. **CONTEXTUAL**: Does the citing paper:
+3. **REFUTING**: Does the citing paper definitively rule out the cited work's hypothesis?
+   - Provide strong statistical evidence against it (>5σ)?
+   - Show the hypothesis is incompatible with observations?
+   - Demonstrate the idea has been abandoned by the field?
+
+   Look for: "ruled out", "excluded", "disproven", "refuted", "inconsistent at Nσ",
+   "no longer viable", "conclusively shown to be incorrect"
+
+   ⚠️ **REFUTING is stronger than CONTRASTING** - only use when evidence is definitive.
+   If a hypothesis is refuted, also create a hypothesis entry (see Step 6b).
+
+4. **CONTEXTUAL**: Does the citing paper:
    - Use it for background?
    - Mention it historically?
    - Reference it for context?
 
    Look for: "first discovered by", "pioneering work", "established that"
 
-4. **METHODOLOGICAL**: Does the citing paper:
+5. **METHODOLOGICAL**: Does the citing paper:
    - Use methods from this paper?
    - Reference software/code?
    - Use datasets from this paper?
 
    Look for: "using the method of", "following", "adopting the approach"
 
-5. **NEUTRAL**: No clear stance, simple acknowledgment
+6. **NEUTRAL**: No clear stance, simple acknowledgment
 
 ### Step 6: Store Classifications
 
@@ -130,6 +141,33 @@ uv run .claude/skills/astro-literature/scripts/litdb.py citations add \
     --reasoning "Brief explanation of why this classification" \
     --agent "subagent-depth-N"
 ```
+
+### Step 6b: Track Ruled-Out Hypotheses
+
+When you classify a citation as **REFUTING**, you should also record the hypothesis that was ruled out:
+
+```bash
+# Add the hypothesis
+uv run .claude/skills/astro-literature/scripts/litdb.py hypothesis add \
+    --name "Brief name of the hypothesis" \
+    --description "What the hypothesis claimed" \
+    --status RULED_OUT \
+    --origin "ORIGINAL_PAPER_BIBCODE" \
+    --ruling "REFUTING_PAPER_BIBCODE" \
+    --reason "Why it was ruled out (brief)"
+
+# Link the refuting paper
+uv run .claude/skills/astro-literature/scripts/litdb.py hypothesis link \
+    --hypothesis-id N --bibcode "REFUTING_BIBCODE" --stance REFUTES
+```
+
+**Examples of ruled-out hypotheses to look for:**
+- Models that predicted something observations don't show
+- Mechanisms that were proposed but later shown to be insufficient
+- Parameter values that are now excluded by data
+- Theories that were superseded by better explanations
+
+This is crucial for answering "what is the state of the art" - knowing what ideas are **no longer in play** is as important as knowing what ideas are current.
 
 ### Step 7: Spawn Sub-Subagents (if depth allows)
 
@@ -183,9 +221,16 @@ After completing your analysis, return a summary to the parent agent:
 - Total citations analyzed: N
 - SUPPORTING: X
 - CONTRASTING: Y
+- REFUTING: R ⚠️
 - CONTEXTUAL: Z
 - METHODOLOGICAL: W
 - NEUTRAL: V
+
+### Ruled-Out Hypotheses Found ⚠️
+[List any hypotheses that have been definitively ruled out, with:
+- Hypothesis name
+- Why it was ruled out
+- Which paper ruled it out]
 
 ### Notable Contrasting Citations
 [List any papers that disagree - these are important for understanding debate]

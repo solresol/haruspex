@@ -270,9 +270,96 @@ When analyzing citations, classify each as:
 |---------------|-------------|-----------------|
 | **SUPPORTING** | Agrees with, builds upon, confirms | "consistent with", "confirms", "as shown by" |
 | **CONTRASTING** | Disagrees, challenges, presents alternatives | "however", "in contrast", "unlike", "tension with" |
+| **REFUTING** | Definitively rules out, provides evidence against | "ruled out", "excluded", "inconsistent at >5σ", "disproven" |
 | **CONTEXTUAL** | Background, history, general facts | "discovered by", "first proposed", "review" |
 | **METHODOLOGICAL** | References methods, data, tools | "using the method of", "data from", "code from" |
 | **NEUTRAL** | Simple acknowledgment, no clear stance | No strong indicators |
+
+**Important**: REFUTING is stronger than CONTRASTING. Use REFUTING only when:
+- Evidence definitively rules out a hypothesis
+- Statistical significance is very high (e.g., >5σ exclusion)
+- The community has moved on from the idea
+- Multiple independent lines of evidence converge against it
+
+## Tracking Hypotheses and Ruled-Out Ideas
+
+A key part of understanding the state of the art is knowing what ideas are **no longer in play**. The skill tracks hypotheses with these statuses:
+
+| Status | Meaning |
+|--------|---------|
+| **ACTIVE** | Still viable, actively being tested |
+| **RULED_OUT** | Definitively refuted by evidence |
+| **SUPERSEDED** | Replaced by a better theory |
+| **UNCERTAIN** | Debated, status unclear |
+
+### Hypothesis CLI Commands
+```bash
+# Add a hypothesis
+uv run scripts/litdb.py hypothesis add \
+    --name "Cold Dark Matter halos are isothermal" \
+    --description "Early models assumed isothermal density profiles" \
+    --status RULED_OUT \
+    --ruling "1997ApJ...490..493N" \
+    --reason "NFW profile shows halos have cusps, not cores"
+
+# List all hypotheses
+uv run scripts/litdb.py hypothesis list
+
+# List only ruled-out hypotheses (for the report)
+uv run scripts/litdb.py hypothesis ruled-out
+
+# Update a hypothesis status
+uv run scripts/litdb.py hypothesis update --id 1 --status RULED_OUT \
+    --ruling "2023ApJ...XXX" --reason "New observations exclude this model"
+
+# Link a paper to a hypothesis
+uv run scripts/litdb.py hypothesis link \
+    --hypothesis-id 1 --bibcode "2023ApJ...XXX" --stance REFUTES
+```
+
+## Output Format
+
+When answering a research question, include a **"No Longer In Play"** section:
+
+```markdown
+## Research Question: [User's question]
+
+### Summary
+[2-3 sentence answer]
+
+### Current State of the Art
+[What the field currently believes, based on supporting citations]
+
+### Key Papers
+1. [Author et al. Year] - [Brief description]
+
+### Scientific Consensus
+[Points most researchers agree on]
+
+### Areas of Active Debate
+[Where disagreement exists]
+
+### No Longer In Play ⚠️
+These ideas were once considered but have been ruled out:
+
+1. **[Hypothesis Name]** - RULED OUT
+   - Originally proposed by: [Author, Year]
+   - Ruled out by: [Author, Year]
+   - Why: [Brief explanation of the evidence against it]
+   - Superseded by: [Current theory, if applicable]
+
+2. **[Another Hypothesis]** - SUPERSEDED
+   ...
+
+### Citation Analysis
+- Papers examined: N
+- Supporting: X%
+- Contrasting: Y%
+- Refuting: Z% ⚠️
+
+### Recommended Reading
+[Papers that best explain the current understanding]
+```
 
 ## Important Notes
 
@@ -280,6 +367,7 @@ When analyzing citations, classify each as:
 - **Rate Limiting**: ADS has query limits; space out requests
 - **Database Persistence**: Results accumulate across sessions
 - **Incremental Analysis**: Check database before re-analyzing papers
+- **Track ruled-out ideas**: Understanding what doesn't work is as important as what does
 - Prefer refereed publications for consensus views
 - High citation count doesn't always mean high quality
 - Be explicit about limitations and uncertainties

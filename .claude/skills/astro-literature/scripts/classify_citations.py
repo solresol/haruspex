@@ -9,9 +9,20 @@ text is not available.
 Citation Types:
 - SUPPORTING: Agrees with, builds upon, confirms, or validates the cited work
 - CONTRASTING: Disagrees with, challenges, questions, or presents alternatives
+- REFUTING: Definitively rules out, provides strong evidence against hypothesis
 - CONTEXTUAL: Provides background, general statements, historical context
 - METHODOLOGICAL: References methods, data, tools, or techniques
 - NEUTRAL: Simple acknowledgment without clear stance
+
+TODO: Replace pattern-based classification with LLM classification.
+      The current regex patterns are a heuristic approximation. For more
+      accurate classification, each citation sentence should be sent to
+      an LLM with the context of both papers and asked to classify the
+      relationship. This would enable:
+      - Better understanding of nuanced language
+      - Detection of sarcasm or qualified statements
+      - Cross-referencing with paper content
+      - Confidence calibration based on reasoning
 """
 
 import argparse
@@ -58,6 +69,25 @@ CONTRAST_PATTERNS = [
     r'\b(at\s+odds\s+with)\b',
 ]
 
+# Patterns indicating definitive refutation (stronger than contrast)
+REFUTE_PATTERNS = [
+    r'\b(rule[ds]?\s+out|ruled\s+out)\b',
+    r'\b(exclude[ds]?|excluded)\b',
+    r'\b(disprove[dns]?|disproven)\b',
+    r'\b(refute[ds]?|refuted|refuting)\b',
+    r'\b(reject[eds]?|rejected)\b',
+    r'\bno\s+longer\s+(viable|tenable|valid)\b',
+    r'\b(definitively|conclusively)\s+(shown|demonstrated|proved)\b',
+    r'\b(incompatible|irreconcilable)\s+with\b',
+    r'\b(inconsistent\s+at|excluded\s+at)\s+\d+\s*[σs]',  # e.g., "excluded at 5σ"
+    r'\b>\s*\d+\s*[σs]\s+(exclusion|tension)',
+    r'\b(firmly|strongly)\s+(excluded|ruled\s+out|rejected)\b',
+    r'\b(abandoned|discarded|superseded)\b',
+    r'\b(obsolete|outdated)\s+(model|theory|hypothesis)\b',
+    r'\b(fatal|insurmountable)\s+(flaw|problem)\b',
+    r'\b(cannot|could\s+not)\s+(explain|account\s+for)\b.*\bobserv',
+]
+
 # Patterns indicating methodological reference
 METHOD_PATTERNS = [
     r'\b(method|methods|methodology)\b.*\b(described|developed|introduced)\s+by\b',
@@ -97,6 +127,7 @@ def classify_by_patterns(text):
     scores = {
         'SUPPORTING': 0,
         'CONTRASTING': 0,
+        'REFUTING': 0,
         'METHODOLOGICAL': 0,
         'CONTEXTUAL': 0,
     }
@@ -104,6 +135,7 @@ def classify_by_patterns(text):
     matched = {
         'SUPPORTING': [],
         'CONTRASTING': [],
+        'REFUTING': [],
         'METHODOLOGICAL': [],
         'CONTEXTUAL': [],
     }
@@ -117,6 +149,12 @@ def classify_by_patterns(text):
         if re.search(pattern, text, re.IGNORECASE):
             scores['CONTRASTING'] += 1
             matched['CONTRASTING'].append(pattern)
+
+    # REFUTING patterns get double weight since they're more definitive
+    for pattern in REFUTE_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            scores['REFUTING'] += 2
+            matched['REFUTING'].append(pattern)
 
     for pattern in METHOD_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
@@ -144,6 +182,10 @@ def classify_by_patterns(text):
     second_highest = sorted(scores.values(), reverse=True)[1]
     if second_highest > 0 and second_highest >= max_score * 0.7:
         confidence *= 0.6  # Reduce confidence when signals are mixed
+
+    # Boost confidence for REFUTING when patterns are strong
+    if classification == 'REFUTING' and len(matched['REFUTING']) >= 2:
+        confidence = min(confidence * 1.2, 0.95)
 
     return classification, min(confidence, 0.95), matched[classification]
 
@@ -210,48 +252,67 @@ def aggregate_classifications(classifications):
     counts = {
         'SUPPORTING': 0,
         'CONTRASTING': 0,
+        'REFUTING': 0,
         'CONTEXTUAL': 0,
         'METHODOLOGICAL': 0,
         'NEUTRAL': 0
     }
 
     high_confidence = []  # confidence > 0.7
-    controversial = []  # papers with both support and contrast
+    refuting_citations = []  # papers that refute
 
     for c in classifications:
         counts[c['classification']] += 1
         if c['confidence'] > 0.7:
             high_confidence.append(c)
+        if c['classification'] == 'REFUTING':
+            refuting_citations.append(c)
 
     total = len(classifications)
     percentages = {k: round(v / total * 100, 1) if total > 0 else 0
                    for k, v in counts.items()}
 
-    return {
+    result = {
         'total_citations': total,
         'counts': counts,
         'percentages': percentages,
         'high_confidence_count': len(high_confidence),
-        'consensus_indicator': _calculate_consensus(counts, total)
+        'consensus_indicator': _calculate_consensus(counts, total),
+        'refuting_count': len(refuting_citations),
     }
+
+    # Flag if hypothesis appears to be ruled out
+    if len(refuting_citations) >= 2:
+        result['hypothesis_status'] = 'LIKELY_RULED_OUT'
+    elif len(refuting_citations) == 1:
+        result['hypothesis_status'] = 'POSSIBLY_RULED_OUT'
+    else:
+        result['hypothesis_status'] = 'ACTIVE'
+
+    return result
 
 
 def _calculate_consensus(counts, total):
     """
     Calculate a consensus indicator based on support vs contrast ratio.
 
-    Returns a value from -1 (strong disagreement) to +1 (strong support)
+    Returns a value from -1 (strong disagreement/refutation) to +1 (strong support)
+    REFUTING counts double against since it's definitive.
     """
     if total == 0:
         return 0
 
     support = counts['SUPPORTING']
     contrast = counts['CONTRASTING']
+    refuting = counts.get('REFUTING', 0)
 
-    if support + contrast == 0:
+    # Refuting counts double
+    against = contrast + (refuting * 2)
+
+    if support + against == 0:
         return 0  # No clear signals
 
-    return round((support - contrast) / (support + contrast), 2)
+    return round((support - against) / (support + against), 2)
 
 
 def load_citations(input_file):
@@ -362,9 +423,12 @@ def format_summary_output(data):
     counts = data['summary']['counts']
     pcts = data['summary']['percentages']
 
+    refuting_marker = " ⚠️" if counts.get('REFUTING', 0) > 0 else ""
+
     lines.extend([
         f"  SUPPORTING:     {counts['SUPPORTING']:4d} ({pcts['SUPPORTING']:5.1f}%)",
         f"  CONTRASTING:    {counts['CONTRASTING']:4d} ({pcts['CONTRASTING']:5.1f}%)",
+        f"  REFUTING:       {counts.get('REFUTING', 0):4d} ({pcts.get('REFUTING', 0):5.1f}%){refuting_marker}",
         f"  CONTEXTUAL:     {counts['CONTEXTUAL']:4d} ({pcts['CONTEXTUAL']:5.1f}%)",
         f"  METHODOLOGICAL: {counts['METHODOLOGICAL']:4d} ({pcts['METHODOLOGICAL']:5.1f}%)",
         f"  NEUTRAL:        {counts['NEUTRAL']:4d} ({pcts['NEUTRAL']:5.1f}%)",
@@ -377,7 +441,7 @@ def format_summary_output(data):
     elif consensus > 0.2:
         consensus_text = "Generally supported"
     elif consensus < -0.5:
-        consensus_text = "Significant disagreement in the literature"
+        consensus_text = "Significant disagreement/refutation in the literature"
     elif consensus < -0.2:
         consensus_text = "Some disagreement present"
     else:
@@ -399,6 +463,36 @@ def format_summary_output(data):
     for c in supporting[:5]:
         lines.append(f"  [{c['confidence']:.2f}] {c['citing_title'][:60]}...")
         lines.append(f"         {c['citing_bibcode']} ({c['citing_year']})")
+
+    # REFUTING citations section (shown before CONTRASTING since more important)
+    refuting = [c for c in data['classifications']
+                if c['classification'] == 'REFUTING']
+
+    if refuting:
+        lines.extend([
+            "",
+            "-" * 70,
+            "⚠️  REFUTING CITATIONS (HYPOTHESIS MAY BE RULED OUT)",
+            "-" * 70,
+        ])
+
+        refuting.sort(key=lambda x: x['confidence'], reverse=True)
+
+        for c in refuting:
+            lines.append(f"  [{c['confidence']:.2f}] {c['citing_title'][:60]}...")
+            lines.append(f"         {c['citing_bibcode']} ({c['citing_year']})")
+            if c.get('reasoning'):
+                lines.append(f"         Reason: {c['reasoning'][:50]}...")
+
+        # Hypothesis status warning
+        hypothesis_status = data['summary'].get('hypothesis_status', 'ACTIVE')
+        if hypothesis_status == 'LIKELY_RULED_OUT':
+            lines.append("")
+            lines.append("  ⚠️  Multiple refuting citations found!")
+            lines.append("      This hypothesis appears to have been RULED OUT.")
+        elif hypothesis_status == 'POSSIBLY_RULED_OUT':
+            lines.append("")
+            lines.append("  ⚠️  Refuting citation found - verify hypothesis status.")
 
     lines.extend([
         "",

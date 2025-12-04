@@ -36,12 +36,14 @@ CREATE TABLE IF NOT EXISTS papers (
 );
 
 -- Citations table: stores analyzed citation relationships
+-- REFUTING is stronger than CONTRASTING - means the citing paper provides
+-- evidence that definitively rules out the cited paper's hypothesis
 CREATE TABLE IF NOT EXISTS citations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     citing_bibcode TEXT NOT NULL,
     cited_bibcode TEXT NOT NULL,
     classification TEXT CHECK(classification IN
-        ('SUPPORTING', 'CONTRASTING', 'CONTEXTUAL', 'METHODOLOGICAL', 'NEUTRAL')),
+        ('SUPPORTING', 'CONTRASTING', 'REFUTING', 'CONTEXTUAL', 'METHODOLOGICAL', 'NEUTRAL')),
     confidence REAL CHECK(confidence >= 0 AND confidence <= 1),
     context_text TEXT,
     reasoning TEXT,
@@ -50,6 +52,35 @@ CREATE TABLE IF NOT EXISTS citations (
     FOREIGN KEY (citing_bibcode) REFERENCES papers(bibcode),
     FOREIGN KEY (cited_bibcode) REFERENCES papers(bibcode),
     UNIQUE(citing_bibcode, cited_bibcode)
+);
+
+-- Hypotheses table: tracks scientific hypotheses/theories and their status
+-- A hypothesis can be: ACTIVE (still viable), RULED_OUT (refuted by evidence),
+-- SUPERSEDED (replaced by better theory), or UNCERTAIN (debated)
+CREATE TABLE IF NOT EXISTS hypotheses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    status TEXT CHECK(status IN ('ACTIVE', 'RULED_OUT', 'SUPERSEDED', 'UNCERTAIN'))
+        DEFAULT 'UNCERTAIN',
+    originating_bibcode TEXT,  -- Paper that first proposed this
+    ruling_bibcode TEXT,       -- Paper that ruled it out (if applicable)
+    ruled_out_reason TEXT,     -- Why it was ruled out
+    superseded_by TEXT,        -- Name of hypothesis that replaced it
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (originating_bibcode) REFERENCES papers(bibcode),
+    FOREIGN KEY (ruling_bibcode) REFERENCES papers(bibcode)
+);
+
+-- Link hypotheses to papers that discuss them
+CREATE TABLE IF NOT EXISTS hypothesis_papers (
+    hypothesis_id INTEGER,
+    bibcode TEXT,
+    stance TEXT CHECK(stance IN ('SUPPORTS', 'REFUTES', 'DISCUSSES', 'PROPOSES')),
+    FOREIGN KEY (hypothesis_id) REFERENCES hypotheses(id),
+    FOREIGN KEY (bibcode) REFERENCES papers(bibcode),
+    PRIMARY KEY (hypothesis_id, bibcode)
 );
 
 -- Research sessions table: tracks research queries
@@ -78,6 +109,7 @@ CREATE TABLE IF NOT EXISTS session_papers (
 CREATE INDEX IF NOT EXISTS idx_citations_citing ON citations(citing_bibcode);
 CREATE INDEX IF NOT EXISTS idx_citations_cited ON citations(cited_bibcode);
 CREATE INDEX IF NOT EXISTS idx_citations_classification ON citations(classification);
+CREATE INDEX IF NOT EXISTS idx_hypotheses_status ON hypotheses(status);
 CREATE INDEX IF NOT EXISTS idx_papers_year ON papers(year);
 """
 
@@ -324,13 +356,18 @@ def citations_summary(args):
     print("-" * 40)
     print(f"  Total: {total}")
 
-    # Calculate consensus score
+    # Calculate consensus score (REFUTING counts double against)
     supporting = next((r['count'] for r in rows if r['classification'] == 'SUPPORTING'), 0)
     contrasting = next((r['count'] for r in rows if r['classification'] == 'CONTRASTING'), 0)
+    refuting = next((r['count'] for r in rows if r['classification'] == 'REFUTING'), 0)
 
-    if supporting + contrasting > 0:
-        consensus = (supporting - contrasting) / (supporting + contrasting)
+    against = contrasting + (refuting * 2)  # Refuting counts double
+    if supporting + against > 0:
+        consensus = (supporting - against) / (supporting + against)
         print(f"  Consensus score: {consensus:+.2f}")
+
+    if refuting > 0:
+        print(f"  ⚠️  {refuting} REFUTING citations - hypothesis may be ruled out")
     return 0
 
 
@@ -425,6 +462,157 @@ def session_add_paper(args):
 
 
 # ============================================================================
+# Hypothesis Commands
+# ============================================================================
+
+def hypothesis_add(args):
+    """Add a hypothesis to track."""
+    conn = get_db()
+
+    cursor = conn.execute("""
+        INSERT INTO hypotheses
+        (name, description, status, originating_bibcode, ruling_bibcode,
+         ruled_out_reason, superseded_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        args.name,
+        args.description,
+        args.status,
+        args.origin,
+        args.ruling,
+        args.reason,
+        args.superseded_by
+    ))
+    conn.commit()
+    print(f"Added hypothesis [{cursor.lastrowid}]: {args.name} ({args.status})")
+    return 0
+
+
+def hypothesis_list(args):
+    """List hypotheses."""
+    conn = get_db()
+
+    query = "SELECT * FROM hypotheses"
+    params = []
+
+    if args.status:
+        query += " WHERE status = ?"
+        params.append(args.status.upper())
+
+    query += " ORDER BY updated_at DESC"
+
+    rows = conn.execute(query, params).fetchall()
+
+    if args.format == 'json':
+        print(json.dumps([dict(r) for r in rows], indent=2))
+    else:
+        if not rows:
+            print("No hypotheses tracked yet.")
+            return 0
+
+        for row in rows:
+            status_icon = {
+                'ACTIVE': '✓',
+                'RULED_OUT': '✗',
+                'SUPERSEDED': '→',
+                'UNCERTAIN': '?'
+            }.get(row['status'], '?')
+
+            print(f"[{row['id']}] {status_icon} {row['name']} ({row['status']})")
+            if row['description']:
+                print(f"    {row['description'][:60]}...")
+            if row['status'] == 'RULED_OUT' and row['ruled_out_reason']:
+                print(f"    Ruled out: {row['ruled_out_reason'][:60]}...")
+            if row['status'] == 'SUPERSEDED' and row['superseded_by']:
+                print(f"    Superseded by: {row['superseded_by']}")
+    return 0
+
+
+def hypothesis_update(args):
+    """Update a hypothesis."""
+    conn = get_db()
+
+    updates = ["updated_at = ?"]
+    params = [datetime.now().isoformat()]
+
+    if args.status:
+        updates.append("status = ?")
+        params.append(args.status)
+    if args.ruling:
+        updates.append("ruling_bibcode = ?")
+        params.append(args.ruling)
+    if args.reason:
+        updates.append("ruled_out_reason = ?")
+        params.append(args.reason)
+    if args.superseded_by:
+        updates.append("superseded_by = ?")
+        params.append(args.superseded_by)
+
+    params.append(args.id)
+
+    conn.execute(f"""
+        UPDATE hypotheses
+        SET {', '.join(updates)}
+        WHERE id = ?
+    """, params)
+    conn.commit()
+    print(f"Updated hypothesis {args.id}")
+    return 0
+
+
+def hypothesis_link(args):
+    """Link a paper to a hypothesis."""
+    conn = get_db()
+
+    conn.execute("""
+        INSERT OR REPLACE INTO hypothesis_papers
+        (hypothesis_id, bibcode, stance)
+        VALUES (?, ?, ?)
+    """, (args.hypothesis_id, args.bibcode, args.stance))
+    conn.commit()
+    print(f"Linked {args.bibcode} to hypothesis {args.hypothesis_id} ({args.stance})")
+    return 0
+
+
+def hypothesis_ruled_out(args):
+    """List ruled-out hypotheses with details."""
+    conn = get_db()
+
+    rows = conn.execute("""
+        SELECT h.*, p.title as ruling_paper_title
+        FROM hypotheses h
+        LEFT JOIN papers p ON h.ruling_bibcode = p.bibcode
+        WHERE h.status IN ('RULED_OUT', 'SUPERSEDED')
+        ORDER BY h.updated_at DESC
+    """).fetchall()
+
+    if args.format == 'json':
+        print(json.dumps([dict(r) for r in rows], indent=2))
+    else:
+        if not rows:
+            print("No ruled-out hypotheses yet.")
+            return 0
+
+        print("=" * 60)
+        print("RULED OUT / SUPERSEDED HYPOTHESES")
+        print("=" * 60)
+
+        for row in rows:
+            print(f"\n✗ {row['name']}")
+            print(f"  Status: {row['status']}")
+            if row['description']:
+                print(f"  Description: {row['description']}")
+            if row['ruled_out_reason']:
+                print(f"  Why ruled out: {row['ruled_out_reason']}")
+            if row['ruling_bibcode']:
+                title = row['ruling_paper_title'] or row['ruling_bibcode']
+                print(f"  Ruling paper: {title[:50]}...")
+            if row['superseded_by']:
+                print(f"  Superseded by: {row['superseded_by']}")
+    return 0
+
+
+# ============================================================================
 # Export/Stats Commands
 # ============================================================================
 
@@ -505,6 +693,7 @@ def show_stats(args):
     paper_count = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
     citation_count = conn.execute("SELECT COUNT(*) FROM citations").fetchone()[0]
     session_count = conn.execute("SELECT COUNT(*) FROM research_sessions").fetchone()[0]
+    hypothesis_count = conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone()[0]
 
     print("=" * 50)
     print("LITERATURE DATABASE STATISTICS")
@@ -512,6 +701,7 @@ def show_stats(args):
     print(f"Database: {DB_PATH}")
     print(f"Papers: {paper_count}")
     print(f"Citations: {citation_count}")
+    print(f"Hypotheses: {hypothesis_count}")
     print(f"Sessions: {session_count}")
 
     if citation_count > 0:
@@ -523,7 +713,19 @@ def show_stats(args):
             ORDER BY count DESC
         """).fetchall()
         for row in rows:
-            print(f"  {row['classification']:15} {row['count']}")
+            marker = " ⚠️" if row['classification'] == 'REFUTING' else ""
+            print(f"  {row['classification']:15} {row['count']}{marker}")
+
+    if hypothesis_count > 0:
+        print("\nHypothesis status:")
+        rows = conn.execute("""
+            SELECT status, COUNT(*) as count
+            FROM hypotheses
+            GROUP BY status
+        """).fetchall()
+        for row in rows:
+            icon = {'ACTIVE': '✓', 'RULED_OUT': '✗', 'SUPERSEDED': '→', 'UNCERTAIN': '?'}.get(row['status'], '')
+            print(f"  {icon} {row['status']:15} {row['count']}")
 
     if paper_count > 0:
         print("\nTop cited papers in database:")
@@ -536,6 +738,14 @@ def show_stats(args):
         for row in rows:
             title = row['title'][:40] + '...' if row['title'] and len(row['title']) > 40 else row['title']
             print(f"  [{row['citation_count']:4}] {title}")
+
+    # Show ruled out hypotheses summary
+    ruled_out = conn.execute("""
+        SELECT COUNT(*) FROM hypotheses WHERE status = 'RULED_OUT'
+    """).fetchone()[0]
+    if ruled_out > 0:
+        print(f"\n⚠️  {ruled_out} hypothesis(es) have been RULED OUT")
+        print("   Run: litdb.py hypothesis ruled-out")
 
     return 0
 
@@ -597,9 +807,9 @@ def main():
     c_add.add_argument('--citing', required=True, help='Citing paper bibcode')
     c_add.add_argument('--cited', required=True, help='Cited paper bibcode')
     c_add.add_argument('--classification', '-c', required=True,
-                       choices=['SUPPORTING', 'CONTRASTING', 'CONTEXTUAL',
-                               'METHODOLOGICAL', 'NEUTRAL'],
-                       help='Citation classification')
+                       choices=['SUPPORTING', 'CONTRASTING', 'REFUTING',
+                               'CONTEXTUAL', 'METHODOLOGICAL', 'NEUTRAL'],
+                       help='Citation classification (REFUTING = definitively rules out)')
     c_add.add_argument('--confidence', type=float, help='Confidence score 0-1')
     c_add.add_argument('--context', help='Citation context text')
     c_add.add_argument('--reasoning', help='Classification reasoning')
@@ -650,6 +860,49 @@ def main():
     s_add_paper.add_argument('--depth', type=int, help='Analysis depth level')
     s_add_paper.set_defaults(func=session_add_paper)
 
+    # Hypothesis commands
+    hyp_parser = subparsers.add_parser('hypothesis', help='Hypothesis/theory tracking')
+    hyp_sub = hyp_parser.add_subparsers(dest='subcommand')
+
+    h_add = hyp_sub.add_parser('add', help='Add a hypothesis')
+    h_add.add_argument('--name', '-n', required=True, help='Hypothesis name')
+    h_add.add_argument('--description', '-d', help='Description')
+    h_add.add_argument('--status', '-s',
+                       choices=['ACTIVE', 'RULED_OUT', 'SUPERSEDED', 'UNCERTAIN'],
+                       default='UNCERTAIN', help='Current status')
+    h_add.add_argument('--origin', help='Bibcode of originating paper')
+    h_add.add_argument('--ruling', help='Bibcode of paper that ruled it out')
+    h_add.add_argument('--reason', help='Why it was ruled out')
+    h_add.add_argument('--superseded-by', help='Name of replacing hypothesis')
+    h_add.set_defaults(func=hypothesis_add)
+
+    h_list = hyp_sub.add_parser('list', help='List hypotheses')
+    h_list.add_argument('--status', '-s', help='Filter by status')
+    h_list.add_argument('--format', '-f', choices=['text', 'json'], default='text')
+    h_list.set_defaults(func=hypothesis_list)
+
+    h_update = hyp_sub.add_parser('update', help='Update hypothesis status')
+    h_update.add_argument('--id', type=int, required=True, help='Hypothesis ID')
+    h_update.add_argument('--status', '-s',
+                          choices=['ACTIVE', 'RULED_OUT', 'SUPERSEDED', 'UNCERTAIN'],
+                          help='New status')
+    h_update.add_argument('--ruling', help='Bibcode of ruling paper')
+    h_update.add_argument('--reason', help='Reason for status change')
+    h_update.add_argument('--superseded-by', help='Name of replacing hypothesis')
+    h_update.set_defaults(func=hypothesis_update)
+
+    h_link = hyp_sub.add_parser('link', help='Link paper to hypothesis')
+    h_link.add_argument('--hypothesis-id', type=int, required=True, help='Hypothesis ID')
+    h_link.add_argument('--bibcode', '-b', required=True, help='Paper bibcode')
+    h_link.add_argument('--stance', required=True,
+                        choices=['SUPPORTS', 'REFUTES', 'DISCUSSES', 'PROPOSES'],
+                        help='Paper stance on hypothesis')
+    h_link.set_defaults(func=hypothesis_link)
+
+    h_ruled_out = hyp_sub.add_parser('ruled-out', help='List ruled-out hypotheses')
+    h_ruled_out.add_argument('--format', '-f', choices=['text', 'json'], default='text')
+    h_ruled_out.set_defaults(func=hypothesis_ruled_out)
+
     # Export command
     exp_parser = subparsers.add_parser('export', help='Export data')
     exp_parser.add_argument('--session-id', type=int, help='Export specific session')
@@ -682,6 +935,8 @@ def main():
             cit_parser.print_help()
         elif args.command == 'session':
             sess_parser.print_help()
+        elif args.command == 'hypothesis':
+            hyp_parser.print_help()
         return 0
 
 
