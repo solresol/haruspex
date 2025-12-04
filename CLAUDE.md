@@ -1,0 +1,2 @@
+- Use `uv` to run python programs. Don't use `uv pip`, just use `uv run` and `uv add`
+- In this repository, do not git commit any astronomy research outputs that you are asked to create. This repo is just for the definitions of skills and subagents and other infrastructure.
