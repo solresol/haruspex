@@ -1,0 +1,5 @@
+# Required packages for astro-literature skill
+ads>=0.12.6
+astroquery>=0.4.7
+astropy>=5.0
+requests>=2.28
