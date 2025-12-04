@@ -1,11 +1,13 @@
 ---
 name: astro-literature
-description: Search astronomical literature using ADS, analyze citation networks, and determine scientific consensus. Use when analyzing research questions about astronomy topics.
+description: Search astronomical literature using ADS, analyze citation networks with recursive subagents, and determine scientific consensus. Use when analyzing research questions about astronomy topics.
 ---
 
 # Astronomy Literature Review Skill
 
-This skill enables comprehensive astronomical literature review by querying NASA ADS, SIMBAD, and NED databases to answer research questions and determine the state of the art on any astronomy topic.
+This skill enables comprehensive astronomical literature review by querying NASA ADS, SIMBAD, and NED databases. It uses a **recursive subagent architecture** where each paper is analyzed by a dedicated agent that can spawn additional agents to analyze important cited papers.
+
+All analysis results are stored in a **SQLite database** for persistence and querying.
 
 ## When to Use This Skill
 
@@ -13,7 +15,7 @@ This skill enables comprehensive astronomical literature review by querying NASA
 - Finding what the scientific consensus is on a topic
 - Analyzing citation networks to understand how papers support or contradict each other
 - Cross-referencing astronomical objects across databases
-- Identifying key papers and their influence on a field
+- Building a knowledge base of citation relationships
 
 ## Setup Requirements
 
@@ -25,150 +27,259 @@ An ADS API token is required. The user should:
    Or create the file: `~/.ads/dev_key` containing the token
 
 ### Python Dependencies
-Install required packages:
+The skill uses `uv` for dependency management. From the skill directory:
 ```bash
-pip install astroquery ads requests
+cd .claude/skills/astro-literature
+uv sync
 ```
+
+Or run scripts directly (uv will auto-install dependencies):
+```bash
+uv run scripts/ads_search.py --help
+```
+
+### Database Location
+The SQLite database is stored at: `~/.astro-literature/citations.db`
+
+The database is created automatically on first use. You can view or modify it using the CLI tool:
+```bash
+uv run .claude/skills/astro-literature/scripts/litdb.py --help
+```
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Main Agent (You)                         │
+│  - Receives research question                               │
+│  - Searches ADS for seed papers                             │
+│  - Spawns Paper Analysis Subagents                          │
+│  - Synthesizes final answer from database                   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Paper Analysis Subagent                        │
+│  - Given: bibcode/URL, research question, depth limit       │
+│  - Fetches paper metadata and abstract from ADS             │
+│  - Analyzes each citation in context                        │
+│  - Classifies citation relationship                         │
+│  - Stores results in SQLite database                        │
+│  - May spawn sub-subagents for important cited papers       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   SQLite Database                           │
+│  ~/.astro-literature/citations.db                           │
+│  - papers: metadata cache                                   │
+│  - citations: classified relationships                      │
+│  - research_sessions: query history                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Database Schema
+
+The database has these tables:
+
+### papers
+Stores paper metadata fetched from ADS.
+- `bibcode` (PRIMARY KEY): ADS bibcode
+- `title`, `authors` (JSON), `year`, `publication`, `abstract`
+- `doi`, `ads_url`, `citation_count`
+- `fetched_at`: When the paper was fetched
+
+### citations
+Stores analyzed citation relationships.
+- `citing_bibcode`, `cited_bibcode`: The citation edge
+- `classification`: SUPPORTING, CONTRASTING, CONTEXTUAL, METHODOLOGICAL, NEUTRAL
+- `confidence`: 0.0-1.0 confidence score
+- `context_text`: The text where the citation appears (if available)
+- `reasoning`: Why this classification was chosen
+- `analyzed_at`: When the analysis was done
+
+### research_sessions
+Tracks research queries for continuity.
+- `question`: The research question asked
+- `started_at`, `completed_at`: Timestamps
+- `summary`: Final synthesized answer
+- `consensus_score`: -1.0 (disagreement) to +1.0 (strong consensus)
 
 ## Workflow
 
-When the user asks a research question about astronomy, follow this workflow:
-
 ### Step 1: Parse the Research Question
-Extract key concepts from the question:
+Extract key concepts:
 - Main topic/phenomenon
 - Specific objects (if any)
-- Time constraints (recent work vs historical)
+- Time constraints
 - Any specific authors or papers mentioned
 
-### Step 2: Search ADS for Relevant Papers
-Use the `scripts/ads_search.py` script to find papers:
-
+### Step 2: Create Research Session
 ```bash
-python .claude/skills/astro-literature/scripts/ads_search.py --query "your search query" --rows 50
+uv run .claude/skills/astro-literature/scripts/litdb.py session create \
+    --question "What is the current understanding of dark matter halos?"
 ```
 
-Query syntax tips:
-- Use quotes for exact phrases: `"dark energy"`
-- Use `author:"name"` for author searches
-- Use `title:keyword` or `abstract:keyword` for specific fields
-- Use `year:2020-2024` for date ranges
-- Use `citations(query)` to find papers citing matches
-- Use `references(query)` to find papers cited by matches
-
-### Step 3: Analyze Citation Network
-For key papers found, analyze their citation relationships:
-
+### Step 3: Search ADS for Seed Papers
 ```bash
-python .claude/skills/astro-literature/scripts/citation_analysis.py --bibcode "2023ApJ...XXX...XX"
+uv run .claude/skills/astro-literature/scripts/ads_search.py \
+    --query 'abstract:"dark matter halo" year:2020-2024 property:refereed' \
+    --rows 20 --format json
 ```
 
-This script:
-- Retrieves papers that cite the target paper
-- Retrieves papers referenced by the target paper
-- Searches for context around citations (when available)
-- Classifies citation types
+### Step 4: Spawn Paper Analysis Subagents
 
-### Step 4: Classify Citation Context
-For each citation found, determine its type:
-- **Supporting**: Citation explicitly agrees with or builds upon the cited work
-- **Contrasting**: Citation disagrees with, challenges, or presents alternatives
-- **Contextual**: Citation provides background, describes general facts
-- **Methodological**: Citation references methods, data, or tools
-- **Neutral**: Simple acknowledgment without stance
+For each important seed paper, spawn a subagent using the **Task tool**:
 
-Use the `scripts/classify_citations.py` script to help classify:
-
-```bash
-python .claude/skills/astro-literature/scripts/classify_citations.py --input citations.json
+```
+Use the Task tool with these parameters:
+- subagent_type: "general-purpose"
+- prompt: See the subagent prompt template below
 ```
 
-### Step 5: Cross-Reference with SIMBAD/NED (Optional)
-If the question involves specific astronomical objects:
+**Subagent Prompt Template:**
+```
+You are analyzing a scientific paper for a literature review.
+
+RESEARCH QUESTION: [The user's question]
+PAPER TO ANALYZE: [bibcode or ADS URL]
+DEPTH LIMIT: [How many levels deep to go, e.g., 2]
+CURRENT DEPTH: [Current recursion depth, e.g., 0]
+
+Instructions:
+1. Read the subagent instructions at:
+   .claude/skills/astro-literature/subagent-instructions.md
+
+2. Follow those instructions to:
+   - Fetch paper metadata using ads_search.py
+   - Store paper in database using litdb.py
+   - Analyze citations and classify each one
+   - Store citation classifications in database
+   - If CURRENT_DEPTH < DEPTH_LIMIT, spawn sub-subagents for
+     papers that appear highly relevant to the research question
+
+3. Return a summary of:
+   - Paper title and key findings
+   - Number of citations analyzed
+   - Classification breakdown (supporting/contrasting/etc.)
+   - Any papers you spawned subagents for
+```
+
+### Step 5: Query the Database for Results
+
+After subagents complete, query the accumulated knowledge:
 
 ```bash
-python .claude/skills/astro-literature/scripts/object_lookup.py --object "M31" --database simbad
-python .claude/skills/astro-literature/scripts/object_lookup.py --object "NGC 224" --database ned
+# View all citations for a paper
+uv run .claude/skills/astro-literature/scripts/litdb.py citations list \
+    --bibcode "2023ApJ...XXX...XX"
+
+# Get classification summary
+uv run .claude/skills/astro-literature/scripts/litdb.py citations summary \
+    --bibcode "2023ApJ...XXX...XX"
+
+# Find contrasting citations
+uv run .claude/skills/astro-literature/scripts/litdb.py citations list \
+    --classification CONTRASTING
+
+# Export for analysis
+uv run .claude/skills/astro-literature/scripts/litdb.py export \
+    --session-id 1 --format json
 ```
 
 ### Step 6: Synthesize Findings
-Produce a structured answer that includes:
 
-1. **Summary**: One-paragraph answer to the research question
-2. **State of the Art**: Current scientific consensus or major viewpoints
-3. **Key Papers**: Most influential papers with brief descriptions
-4. **Points of Agreement**: What most researchers accept
-5. **Points of Debate**: Where there is active disagreement
-6. **Citation Analysis**: Breakdown of supporting vs contrasting citations
-7. **Recommended Reading**: 3-5 papers for deeper understanding
-
-## Example Queries
-
-### Simple Topic Query
-User: "What is the current understanding of dark matter halos?"
-
-1. Search: `abstract:"dark matter halo" year:2020-2024 property:refereed`
-2. Identify top-cited papers
-3. Analyze citation network for key paper
-4. Report consensus and ongoing debates
-
-### Object-Specific Query
-User: "What do we know about the supermassive black hole in M87?"
-
-1. Query SIMBAD for M87 identifiers
-2. Search ADS: `object:M87 abstract:"black hole" year:2019-2024`
-3. Include Event Horizon Telescope papers
-4. Analyze how subsequent papers cite EHT results
-
-### Methodology Debate Query
-User: "Is there disagreement about how to measure the Hubble constant?"
-
-1. Search: `title:"Hubble constant" OR title:"H0 tension"`
-2. Find papers on different measurement methods
-3. Specifically look for contrasting citations
-4. Map the "tension" landscape
-
-## Output Format
-
-Present findings in this structure:
+Query the database and produce a structured answer:
 
 ```markdown
 ## Research Question: [User's question]
 
 ### Summary
-[2-3 sentence answer]
+[2-3 sentence answer based on citation analysis]
+
+### Database Statistics
+- Papers analyzed: N (from `litdb.py papers count`)
+- Citations classified: M (from `litdb.py citations count`)
+- Analysis depth: D levels
 
 ### Current State of the Art
-[Overview of where the field stands]
+[Based on supporting citations from recent papers]
 
 ### Key Papers
 1. [Author et al. Year] - [Brief description] (N citations)
-2. ...
+   - Supporting citations: X
+   - Contrasting citations: Y
 
 ### Scientific Consensus
-- [Point of agreement 1]
-- [Point of agreement 2]
+[Based on consensus_score and classification breakdown]
 
 ### Areas of Active Debate
-- [Debate topic 1]: [Side A] vs [Side B]
-- [Debate topic 2]: ...
-
-### Citation Analysis
-- Papers examined: N
-- Supporting citations: X%
-- Contrasting citations: Y%
-- Contextual citations: Z%
+[Papers with high contrasting citation counts]
 
 ### Recommended Reading
-1. [Paper 1] - [Why it's recommended]
-2. ...
+[Top papers by relevance and citation impact]
 ```
+
+## CLI Tool Reference
+
+The `litdb.py` script manages the SQLite database. Run from the skill directory or use full paths:
+
+```bash
+# From the skill directory (.claude/skills/astro-literature):
+uv run scripts/litdb.py <command>
+
+# Or with full path from anywhere:
+uv run .claude/skills/astro-literature/scripts/litdb.py <command>
+```
+
+### Paper Commands
+```bash
+uv run scripts/litdb.py papers add --bibcode "..." --title "..." [--json '{...}']
+uv run scripts/litdb.py papers get --bibcode "..."
+uv run scripts/litdb.py papers list [--year 2023] [--limit 20]
+uv run scripts/litdb.py papers count
+```
+
+### Citation Commands
+```bash
+uv run scripts/litdb.py citations add --citing "..." --cited "..." \
+    --classification SUPPORTING [--confidence 0.8] [--context "..."]
+uv run scripts/litdb.py citations list [--bibcode "..."] [--classification CONTRASTING]
+uv run scripts/litdb.py citations summary [--bibcode "..."]
+uv run scripts/litdb.py citations count
+```
+
+### Session Commands
+```bash
+uv run scripts/litdb.py session create --question "..."
+uv run scripts/litdb.py session list
+uv run scripts/litdb.py session complete --id 1 --summary "..." [--consensus-score 0.5]
+```
+
+### Export/Stats
+```bash
+uv run scripts/litdb.py export [--session-id 1] [--format json|csv]
+uv run scripts/litdb.py stats
+```
+
+## Citation Classifications
+
+When analyzing citations, classify each as:
+
+| Classification | Description | Example Signals |
+|---------------|-------------|-----------------|
+| **SUPPORTING** | Agrees with, builds upon, confirms | "consistent with", "confirms", "as shown by" |
+| **CONTRASTING** | Disagrees, challenges, presents alternatives | "however", "in contrast", "unlike", "tension with" |
+| **CONTEXTUAL** | Background, history, general facts | "discovered by", "first proposed", "review" |
+| **METHODOLOGICAL** | References methods, data, tools | "using the method of", "data from", "code from" |
+| **NEUTRAL** | Simple acknowledgment, no clear stance | No strong indicators |
 
 ## Important Notes
 
-- Always check paper publication dates for recency
-- Prefer refereed publications over preprints for consensus views
+- **Depth Limiting**: Always set a depth limit (2-3) to prevent runaway recursion
+- **Rate Limiting**: ADS has query limits; space out requests
+- **Database Persistence**: Results accumulate across sessions
+- **Incremental Analysis**: Check database before re-analyzing papers
+- Prefer refereed publications for consensus views
 - High citation count doesn't always mean high quality
-- Look for review papers to get field overviews
 - Be explicit about limitations and uncertainties
-- Distinguish between observational consensus and theoretical consensus

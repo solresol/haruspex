@@ -1,0 +1,22 @@
+[project]
+name = "astro-literature"
+version = "0.1.0"
+description = "Astronomical literature review tools for citation network analysis"
+readme = "SKILL.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ads>=0.12.6",
+    "astroquery>=0.4.7",
+    "astropy>=5.0",
+    "requests>=2.28",
+]
+
+[project.scripts]
+litdb = "scripts.litdb:main"
+ads-search = "scripts.ads_search:main"
+citation-analysis = "scripts.citation_analysis:main"
+classify-citations = "scripts.classify_citations:main"
+object-lookup = "scripts.object_lookup:main"
+
+[tool.uv]
+dev-dependencies = []

@@ -1,132 +1,262 @@
 # Example Queries and Workflows
 
-This document provides example queries and workflows for the astro-literature skill.
+This document provides example queries and workflows for the astro-literature skill using the subagent architecture and SQLite database.
 
-## Example 1: Topic Survey - Dark Matter Halos
+## Quick Reference
+
+All scripts are run with `uv run` from the skill directory:
+```bash
+cd .claude/skills/astro-literature
+uv run scripts/ads_search.py --help
+uv run scripts/litdb.py --help
+```
+
+Database location: `~/.astro-literature/citations.db`
+
+---
+
+## Example 1: Full Literature Review with Subagents
 
 **Question:** What is the current understanding of dark matter halo profiles?
 
-### Step 1: Initial Search
+### Step 1: Create a Research Session
 ```bash
-python scripts/ads_search.py --query 'title:"dark matter halo" abstract:profile' \
-    --year-start 2020 --refereed --rows 30 --format summary
+uv run scripts/litdb.py session create \
+    --question "What is the current understanding of dark matter halo profiles?"
+```
+Output: `Created session 1: What is the current understanding...`
+
+### Step 2: Search for Seed Papers
+```bash
+uv run scripts/ads_search.py \
+    --query 'title:"dark matter halo" abstract:profile year:2020-2024 property:refereed' \
+    --rows 20 --format summary
 ```
 
-### Step 2: Identify Key Papers
-Look for papers with high citation counts. For example, the NFW profile paper:
-```bash
-python scripts/ads_search.py --query 'author:"Navarro" title:"universal density profile"' \
-    --format json --output nfw.json
+### Step 3: Spawn Subagent for Key Paper
+
+Use the Task tool with subagent_type="general-purpose":
+```
+You are analyzing a scientific paper for a literature review.
+
+RESEARCH_QUESTION: What is the current understanding of dark matter halo profiles?
+PAPER_ID: 1997ApJ...490..493N
+DEPTH_LIMIT: 2
+CURRENT_DEPTH: 0
+SESSION_ID: 1
+
+Instructions:
+1. Read the subagent instructions at:
+   .claude/skills/astro-literature/subagent-instructions.md
+2. Follow those instructions completely.
+3. Return a summary of your analysis.
 ```
 
-### Step 3: Citation Analysis
+### Step 4: Query Database for Results
 ```bash
-python scripts/citation_analysis.py --bibcode 1997ApJ...490..493N \
-    --citing-limit 100 --format json --output nfw_network.json
+# Check how many papers were analyzed
+uv run scripts/litdb.py papers count
+
+# View citation breakdown for the NFW paper
+uv run scripts/litdb.py citations summary --bibcode 1997ApJ...490..493N
+
+# Find contrasting citations (important for debate)
+uv run scripts/litdb.py citations list --classification CONTRASTING
+
+# Overall database stats
+uv run scripts/litdb.py stats
 ```
 
-### Step 4: Classification
+### Step 5: Export and Complete Session
 ```bash
-python scripts/classify_citations.py --input nfw_network.json --format summary
-```
+# Export all data for this session
+uv run scripts/litdb.py export --session-id 1 --format json --output session1.json
 
----
-
-## Example 2: Object-Specific Query - M87 Black Hole
-
-**Question:** What do recent papers say about the supermassive black hole in M87?
-
-### Step 1: Get Object Info
-```bash
-python scripts/object_lookup.py --object "M87" --cross-match
-```
-
-### Step 2: Search ADS
-```bash
-python scripts/ads_search.py --query 'object:M87 abstract:"black hole" year:2019-2024' \
-    --refereed --rows 50
-```
-
-### Step 3: Focus on EHT Results
-```bash
-# The famous first image paper
-python scripts/citation_analysis.py --bibcode 2019ApJ...875L...1E \
-    --citing-limit 100 --format json --output eht_m87.json
-```
-
-### Step 4: Analyze Reception
-```bash
-python scripts/classify_citations.py --input eht_m87.json
-```
-
----
-
-## Example 3: Methodological Debate - Hubble Tension
-
-**Question:** What is the status of the Hubble constant tension?
-
-### Step 1: Search for Key Papers
-```bash
-# Riess et al. (local distance ladder)
-python scripts/ads_search.py --query 'author:"Riess" title:"Hubble" year:2020-2024' \
-    --refereed --rows 20
-
-# Planck Collaboration (CMB-based)
-python scripts/ads_search.py --query 'author:"Planck Collaboration" title:"cosmological parameters"' \
-    --year-start 2018 --refereed --rows 10
-```
-
-### Step 2: Find Papers Discussing Both
-```bash
-python scripts/ads_search.py \
-    --query 'abstract:"Hubble tension" OR abstract:"H0 tension"' \
-    --year-start 2020 --refereed --rows 50
-```
-
-### Step 3: Analyze a Key Tension Paper
-```bash
-python scripts/citation_analysis.py --bibcode 2019NatAs...3..891V \
-    --format json --output tension.json
-python scripts/classify_citations.py --input tension.json
+# Mark session complete with summary
+uv run scripts/litdb.py session complete --id 1 \
+    --summary "NFW profile remains foundational; alternatives include Einasto profile..." \
+    --consensus-score 0.6
 ```
 
 ---
 
-## Example 4: Finding Review Papers
+## Example 2: Hubble Tension Investigation
 
-**Question:** What are the best review papers on exoplanet atmospheres?
+**Question:** What is the current status of the Hubble tension?
 
-### Step 1: Search for Reviews
+### Step 1: Create Session and Find Seed Papers
 ```bash
-python scripts/ads_search.py \
-    --query 'title:review abstract:"exoplanet atmosphere"' \
-    --refereed --sort 'citation_count desc' --rows 20
+uv run scripts/litdb.py session create \
+    --question "What is the current status of the Hubble tension?"
+
+# Find key tension papers
+uv run scripts/ads_search.py \
+    --query 'abstract:"Hubble tension" OR abstract:"H0 tension" year:2020-2024' \
+    --refereed --rows 30 --format json
 ```
 
-### Step 2: Find Most-Cited Recent Work
+### Step 2: Spawn Parallel Subagents
+
+Launch multiple subagents in parallel for different perspectives:
+
+**Subagent 1: Distance Ladder (Riess)**
+```
+PAPER_ID: 2022ApJ...934L...7R  (example Riess paper)
+RESEARCH_QUESTION: What is the current status of the Hubble tension?
+DEPTH_LIMIT: 2
+CURRENT_DEPTH: 0
+```
+
+**Subagent 2: CMB-based (Planck)**
+```
+PAPER_ID: 2020A&A...641A...6P  (Planck 2018)
+RESEARCH_QUESTION: What is the current status of the Hubble tension?
+DEPTH_LIMIT: 2
+CURRENT_DEPTH: 0
+```
+
+### Step 3: Analyze the Debate
 ```bash
-python scripts/ads_search.py \
-    --query 'abstract:"exoplanet atmosphere" property:refereed' \
-    --year-start 2020 --sort 'citation_count desc' --rows 30
+# See all contrasting citations
+uv run scripts/litdb.py citations list --classification CONTRASTING --verbose
+
+# Get overall consensus score
+uv run scripts/litdb.py citations summary
 ```
 
 ---
 
-## Example 5: Author Impact Analysis
+## Example 3: Object-Specific Query with SIMBAD/NED
 
-**Question:** What is the influence of a specific researcher's work?
+**Question:** What do we know about the supermassive black hole in M87?
 
-### Step 1: Find Their Papers
+### Step 1: Cross-Reference Object
 ```bash
-python scripts/ads_search.py --query 'author:"^Sagan, Carl"' \
-    --sort 'citation_count desc' --rows 20
+uv run scripts/object_lookup.py --object "M87" --cross-match
 ```
 
-### Step 2: Analyze Most-Cited Work
+### Step 2: Search with Object Name
 ```bash
-# Pale Blue Dot perspective
-python scripts/citation_analysis.py --bibcode 1994pal..book.....S \
-    --citing-limit 50
+uv run scripts/ads_search.py \
+    --query 'object:M87 abstract:"black hole" year:2019-2024' \
+    --refereed --rows 30 --format json
+```
+
+### Step 3: Focus on EHT Paper
+
+Spawn subagent for the famous first image paper:
+```
+PAPER_ID: 2019ApJ...875L...1E
+RESEARCH_QUESTION: What do we know about the supermassive black hole in M87?
+DEPTH_LIMIT: 2
+CURRENT_DEPTH: 0
+```
+
+### Step 4: Query Results
+```bash
+# How has the EHT paper been received?
+uv run scripts/litdb.py citations summary --bibcode 2019ApJ...875L...1E
+
+# Any challenges to the results?
+uv run scripts/litdb.py citations list \
+    --cited 2019ApJ...875L...1E \
+    --classification CONTRASTING
+```
+
+---
+
+## Example 4: Quick Single-Paper Analysis
+
+For a quick analysis without a full session:
+
+```bash
+# Fetch and store paper
+uv run scripts/ads_search.py --query 'bibcode:2016PhRvL.116f1102A' --format json | \
+    uv run scripts/litdb.py papers add --json "$(cat -)"
+
+# Get citation network
+uv run scripts/citation_analysis.py --bibcode 2016PhRvL.116f1102A \
+    --format json --output /tmp/gw150914.json
+
+# Classify citations
+uv run scripts/classify_citations.py --input /tmp/gw150914.json --format summary
+```
+
+---
+
+## Database CLI Reference
+
+### Papers
+```bash
+# Add a paper (with JSON data)
+uv run scripts/litdb.py papers add --json '{"bibcode":"...", "title":"...", ...}'
+
+# Get paper details
+uv run scripts/litdb.py papers get --bibcode "2019ApJ...882L...2S"
+
+# List papers by year
+uv run scripts/litdb.py papers list --year 2023 --limit 10
+
+# Count total papers
+uv run scripts/litdb.py papers count
+```
+
+### Citations
+```bash
+# Add a citation classification
+uv run scripts/litdb.py citations add \
+    --citing "2023ApJ...XXX...YY" \
+    --cited "2019ApJ...882L...2S" \
+    --classification SUPPORTING \
+    --confidence 0.85 \
+    --context "Our results confirm the findings of..." \
+    --reasoning "Explicit confirmation language"
+
+# List citations for a paper
+uv run scripts/litdb.py citations list --bibcode "2019ApJ...882L...2S"
+
+# Filter by classification
+uv run scripts/litdb.py citations list --classification CONTRASTING --verbose
+
+# Get summary statistics
+uv run scripts/litdb.py citations summary --bibcode "2019ApJ...882L...2S"
+```
+
+### Sessions
+```bash
+# Create session
+uv run scripts/litdb.py session create --question "Your question here"
+
+# List sessions
+uv run scripts/litdb.py session list
+
+# Add paper to session
+uv run scripts/litdb.py session add-paper \
+    --session-id 1 \
+    --bibcode "2023ApJ...XXX...YY" \
+    --depth 0 \
+    --seed
+
+# Complete session
+uv run scripts/litdb.py session complete \
+    --id 1 \
+    --summary "Summary of findings..." \
+    --consensus-score 0.5
+```
+
+### Export and Stats
+```bash
+# Export session data
+uv run scripts/litdb.py export --session-id 1 --format json --output session.json
+
+# Export all as CSV
+uv run scripts/litdb.py export --format csv --output citations.csv
+
+# Show database statistics
+uv run scripts/litdb.py stats
+
+# Reset database (careful!)
+uv run scripts/litdb.py reset --confirm
 ```
 
 ---
@@ -140,6 +270,7 @@ python scripts/citation_analysis.py --bibcode 1994pal..book.....S \
 - `author:"^Last"` - First author only
 - `year:2020-2024` - Date range
 - `bibcode:2019ApJ...` - Specific paper
+- `object:M87` - Papers about object
 
 ### Boolean Operators
 - `AND` (default between terms)
@@ -159,3 +290,15 @@ python scripts/citation_analysis.py --bibcode 1994pal..book.....S \
 - `references(query)` - Papers referenced by results
 - `trending(query)` - Currently trending papers
 - `useful(query)` - Frequently co-cited papers
+
+---
+
+## Tips for Effective Analysis
+
+1. **Start with review papers** to get overview before diving deep
+2. **Use DEPTH_LIMIT=2** for most analyses; 3 only for narrow questions
+3. **Prioritize contrasting citations** - they reveal the debate
+4. **Check high citation papers** - they're usually influential
+5. **Verify recent papers** - the field may have evolved
+6. **Cross-check with SIMBAD/NED** for object-specific queries
+7. **Export sessions** before starting new ones for continuity
