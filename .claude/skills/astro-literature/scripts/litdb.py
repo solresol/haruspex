@@ -2,139 +2,32 @@
 """
 Literature Database CLI Tool
 
-Manages the SQLite database for storing papers, citations, and research sessions.
-Database location: ~/.astro-literature/citations.db
+Manages the database for storing papers, citations, and research sessions.
+Supports both SQLite (default) and PostgreSQL backends.
+
+Database backends:
+  SQLite (default): ~/.astro-literature/citations.db
+  PostgreSQL: Set LITDB_BACKEND=postgresql
+
+Environment variables:
+  LITDB_BACKEND: "sqlite" (default) or "postgresql"
+  LITDB_PG_HOST: PostgreSQL host (default: localhost)
+  LITDB_PG_PORT: PostgreSQL port (default: 5432)
+  LITDB_PG_DATABASE: PostgreSQL database (default: haruspex)
+  LITDB_PG_USER: PostgreSQL user (default: roboscientist)
+  LITDB_PG_PASSWORD: PostgreSQL password (optional, uses ~/.pgpass if not set)
 """
 
 import argparse
 import json
-import sqlite3
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Database location
-DB_DIR = Path.home() / '.astro-literature'
-DB_PATH = DB_DIR / 'citations.db'
-
-SCHEMA = """
--- Papers table: stores paper metadata from ADS
-CREATE TABLE IF NOT EXISTS papers (
-    bibcode TEXT PRIMARY KEY,
-    title TEXT,
-    authors TEXT,  -- JSON array
-    year INTEGER,
-    publication TEXT,
-    abstract TEXT,
-    doi TEXT,
-    ads_url TEXT,
-    citation_count INTEGER,
-    reference_count INTEGER,
-    keywords TEXT,  -- JSON array
-    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Citations table: stores analyzed citation relationships
--- REFUTING is stronger than CONTRASTING - means the citing paper provides
--- evidence that definitively rules out the cited paper's hypothesis
-CREATE TABLE IF NOT EXISTS citations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    citing_bibcode TEXT NOT NULL,
-    cited_bibcode TEXT NOT NULL,
-    classification TEXT CHECK(classification IN
-        ('SUPPORTING', 'CONTRASTING', 'REFUTING', 'CONTEXTUAL', 'METHODOLOGICAL', 'NEUTRAL')),
-    confidence REAL CHECK(confidence >= 0 AND confidence <= 1),
-    context_text TEXT,
-    reasoning TEXT,
-    analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    analyzed_by TEXT,  -- agent identifier
-    FOREIGN KEY (citing_bibcode) REFERENCES papers(bibcode),
-    FOREIGN KEY (cited_bibcode) REFERENCES papers(bibcode),
-    UNIQUE(citing_bibcode, cited_bibcode)
-);
-
--- Hypotheses table: tracks scientific hypotheses/theories and their status
--- A hypothesis can be: ACTIVE (still viable), RULED_OUT (refuted by evidence),
--- SUPERSEDED (replaced by better theory), or UNCERTAIN (debated)
-CREATE TABLE IF NOT EXISTS hypotheses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT,
-    status TEXT CHECK(status IN ('ACTIVE', 'RULED_OUT', 'SUPERSEDED', 'UNCERTAIN'))
-        DEFAULT 'UNCERTAIN',
-    originating_bibcode TEXT,  -- Paper that first proposed this
-    ruling_bibcode TEXT,       -- Paper that ruled it out (if applicable)
-    ruled_out_reason TEXT,     -- Why it was ruled out
-    superseded_by TEXT,        -- Name of hypothesis that replaced it
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (originating_bibcode) REFERENCES papers(bibcode),
-    FOREIGN KEY (ruling_bibcode) REFERENCES papers(bibcode)
-);
-
--- Link hypotheses to papers that discuss them
-CREATE TABLE IF NOT EXISTS hypothesis_papers (
-    hypothesis_id INTEGER,
-    bibcode TEXT,
-    stance TEXT CHECK(stance IN ('SUPPORTS', 'REFUTES', 'DISCUSSES', 'PROPOSES')),
-    FOREIGN KEY (hypothesis_id) REFERENCES hypotheses(id),
-    FOREIGN KEY (bibcode) REFERENCES papers(bibcode),
-    PRIMARY KEY (hypothesis_id, bibcode)
-);
-
--- Research sessions table: tracks research queries
-CREATE TABLE IF NOT EXISTS research_sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    question TEXT NOT NULL,
-    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP,
-    summary TEXT,
-    consensus_score REAL CHECK(consensus_score >= -1 AND consensus_score <= 1)
-);
-
--- Session papers junction: links sessions to analyzed papers
-CREATE TABLE IF NOT EXISTS session_papers (
-    session_id INTEGER,
-    bibcode TEXT,
-    relevance_score REAL,
-    is_seed_paper BOOLEAN DEFAULT FALSE,
-    depth INTEGER DEFAULT 0,
-    FOREIGN KEY (session_id) REFERENCES research_sessions(id),
-    FOREIGN KEY (bibcode) REFERENCES papers(bibcode),
-    PRIMARY KEY (session_id, bibcode)
-);
-
--- Indexes for common queries
-CREATE INDEX IF NOT EXISTS idx_citations_citing ON citations(citing_bibcode);
-CREATE INDEX IF NOT EXISTS idx_citations_cited ON citations(cited_bibcode);
-CREATE INDEX IF NOT EXISTS idx_citations_classification ON citations(classification);
-CREATE INDEX IF NOT EXISTS idx_hypotheses_status ON hypotheses(status);
-CREATE INDEX IF NOT EXISTS idx_papers_year ON papers(year);
-"""
-
-
-def get_db() -> sqlite3.Connection:
-    """Get database connection, creating database if needed."""
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    return conn
-
-
-def json_serialize(obj):
-    """Serialize object to JSON, handling None."""
-    if obj is None:
-        return None
-    return json.dumps(obj)
-
-
-def json_deserialize(s):
-    """Deserialize JSON string, handling None."""
-    if s is None:
-        return None
-    return json.loads(s)
+# Import the database backend abstraction
+from db_backend import get_db, json_serialize, json_deserialize, DatabaseBackend
 
 
 # ============================================================================
@@ -143,7 +36,7 @@ def json_deserialize(s):
 
 def papers_add(args):
     """Add a paper to the database."""
-    conn = get_db()
+    db = get_db()
 
     if args.json:
         data = json.loads(args.json)
@@ -156,12 +49,36 @@ def papers_add(args):
         print("Error: bibcode is required", file=sys.stderr)
         return 1
 
-    conn.execute("""
-        INSERT OR REPLACE INTO papers
-        (bibcode, title, authors, year, publication, abstract, doi, ads_url,
-         citation_count, reference_count, keywords, fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
+    # Use INSERT ... ON CONFLICT for PostgreSQL compatibility
+    backend = os.environ.get('LITDB_BACKEND', 'sqlite').lower()
+    if backend == 'postgresql':
+        query = """
+            INSERT INTO papers
+            (bibcode, title, authors, year, publication, abstract, doi, ads_url,
+             citation_count, reference_count, keywords, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (bibcode) DO UPDATE SET
+                title = EXCLUDED.title,
+                authors = EXCLUDED.authors,
+                year = EXCLUDED.year,
+                publication = EXCLUDED.publication,
+                abstract = EXCLUDED.abstract,
+                doi = EXCLUDED.doi,
+                ads_url = EXCLUDED.ads_url,
+                citation_count = EXCLUDED.citation_count,
+                reference_count = EXCLUDED.reference_count,
+                keywords = EXCLUDED.keywords,
+                fetched_at = EXCLUDED.fetched_at
+        """
+    else:
+        query = """
+            INSERT OR REPLACE INTO papers
+            (bibcode, title, authors, year, publication, abstract, doi, ads_url,
+             citation_count, reference_count, keywords, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+    db.execute(query, (
         bibcode,
         data.get('title', args.title),
         json_serialize(data.get('authors')),
@@ -175,17 +92,18 @@ def papers_add(args):
         json_serialize(data.get('keywords')),
         datetime.now().isoformat()
     ))
-    conn.commit()
+    db.commit()
     print(f"Added paper: {bibcode}")
     return 0
 
 
 def papers_get(args):
     """Get a paper by bibcode."""
-    conn = get_db()
-    row = conn.execute(
+    db = get_db()
+    cursor = db.execute(
         "SELECT * FROM papers WHERE bibcode = ?", (args.bibcode,)
-    ).fetchone()
+    )
+    row = db.fetchone(cursor)
 
     if not row:
         print(f"Paper not found: {args.bibcode}", file=sys.stderr)
@@ -196,7 +114,7 @@ def papers_get(args):
     paper['keywords'] = json_deserialize(paper['keywords'])
 
     if args.format == 'json':
-        print(json.dumps(paper, indent=2))
+        print(json.dumps(paper, indent=2, default=str))
     else:
         print(f"Bibcode: {paper['bibcode']}")
         print(f"Title: {paper['title']}")
@@ -210,7 +128,7 @@ def papers_get(args):
 
 def papers_list(args):
     """List papers in the database."""
-    conn = get_db()
+    db = get_db()
 
     query = "SELECT bibcode, title, year, citation_count FROM papers"
     params = []
@@ -225,10 +143,11 @@ def papers_list(args):
         query += " LIMIT ?"
         params.append(args.limit)
 
-    rows = conn.execute(query, params).fetchall()
+    cursor = db.execute(query, tuple(params))
+    rows = db.fetchall(cursor)
 
     if args.format == 'json':
-        print(json.dumps([dict(r) for r in rows], indent=2))
+        print(json.dumps(rows, indent=2, default=str))
     else:
         for row in rows:
             title = row['title'][:50] + '...' if row['title'] and len(row['title']) > 50 else row['title']
@@ -238,9 +157,10 @@ def papers_list(args):
 
 def papers_count(args):
     """Count papers in the database."""
-    conn = get_db()
-    count = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-    print(count)
+    db = get_db()
+    cursor = db.execute("SELECT COUNT(*) as cnt FROM papers")
+    row = db.fetchone(cursor)
+    print(row['cnt'])
     return 0
 
 
@@ -250,15 +170,34 @@ def papers_count(args):
 
 def citations_add(args):
     """Add a citation relationship."""
-    conn = get_db()
+    db = get_db()
 
     try:
-        conn.execute("""
-            INSERT OR REPLACE INTO citations
-            (citing_bibcode, cited_bibcode, classification, confidence,
-             context_text, reasoning, analyzed_at, analyzed_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+        # Use INSERT ... ON CONFLICT for PostgreSQL compatibility
+        backend = os.environ.get('LITDB_BACKEND', 'sqlite').lower()
+        if backend == 'postgresql':
+            query = """
+                INSERT INTO citations
+                (citing_bibcode, cited_bibcode, classification, confidence,
+                 context_text, reasoning, analyzed_at, analyzed_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (citing_bibcode, cited_bibcode) DO UPDATE SET
+                    classification = EXCLUDED.classification,
+                    confidence = EXCLUDED.confidence,
+                    context_text = EXCLUDED.context_text,
+                    reasoning = EXCLUDED.reasoning,
+                    analyzed_at = EXCLUDED.analyzed_at,
+                    analyzed_by = EXCLUDED.analyzed_by
+            """
+        else:
+            query = """
+                INSERT OR REPLACE INTO citations
+                (citing_bibcode, cited_bibcode, classification, confidence,
+                 context_text, reasoning, analyzed_at, analyzed_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """
+
+        db.execute(query, (
             args.citing,
             args.cited,
             args.classification.upper(),
@@ -268,17 +207,17 @@ def citations_add(args):
             datetime.now().isoformat(),
             args.agent or 'manual'
         ))
-        conn.commit()
+        db.commit()
         print(f"Added citation: {args.citing} -> {args.cited} ({args.classification})")
         return 0
-    except sqlite3.IntegrityError as e:
+    except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
 
 def citations_list(args):
     """List citations."""
-    conn = get_db()
+    db = get_db()
 
     query = "SELECT * FROM citations WHERE 1=1"
     params = []
@@ -305,10 +244,11 @@ def citations_list(args):
         query += " LIMIT ?"
         params.append(args.limit)
 
-    rows = conn.execute(query, params).fetchall()
+    cursor = db.execute(query, tuple(params))
+    rows = db.fetchall(cursor)
 
     if args.format == 'json':
-        print(json.dumps([dict(r) for r in rows], indent=2))
+        print(json.dumps(rows, indent=2, default=str))
     else:
         for row in rows:
             conf = f"[{row['confidence']:.2f}]" if row['confidence'] else "[N/A]"
@@ -321,28 +261,30 @@ def citations_list(args):
 
 def citations_summary(args):
     """Show citation classification summary."""
-    conn = get_db()
+    db = get_db()
 
     if args.bibcode:
         # Summary for a specific paper (as cited)
-        rows = conn.execute("""
+        cursor = db.execute("""
             SELECT classification, COUNT(*) as count,
                    AVG(confidence) as avg_confidence
             FROM citations
             WHERE cited_bibcode = ?
             GROUP BY classification
-        """, (args.bibcode,)).fetchall()
+        """, (args.bibcode,))
+        rows = db.fetchall(cursor)
 
         print(f"Citation summary for: {args.bibcode}")
         print("-" * 40)
     else:
         # Overall summary
-        rows = conn.execute("""
+        cursor = db.execute("""
             SELECT classification, COUNT(*) as count,
                    AVG(confidence) as avg_confidence
             FROM citations
             GROUP BY classification
-        """).fetchall()
+        """)
+        rows = db.fetchall(cursor)
 
         print("Overall citation summary")
         print("-" * 40)
@@ -367,15 +309,16 @@ def citations_summary(args):
         print(f"  Consensus score: {consensus:+.2f}")
 
     if refuting > 0:
-        print(f"  ⚠️  {refuting} REFUTING citations - hypothesis may be ruled out")
+        print(f"  {refuting} REFUTING citations - hypothesis may be ruled out")
     return 0
 
 
 def citations_count(args):
     """Count citations in the database."""
-    conn = get_db()
-    count = conn.execute("SELECT COUNT(*) FROM citations").fetchone()[0]
-    print(count)
+    db = get_db()
+    cursor = db.execute("SELECT COUNT(*) as cnt FROM citations")
+    row = db.fetchone(cursor)
+    print(row['cnt'])
     return 0
 
 
@@ -385,33 +328,45 @@ def citations_count(args):
 
 def session_create(args):
     """Create a new research session."""
-    conn = get_db()
+    db = get_db()
 
-    cursor = conn.execute("""
-        INSERT INTO research_sessions (question, started_at)
-        VALUES (?, ?)
-    """, (args.question, datetime.now().isoformat()))
-    conn.commit()
+    backend = os.environ.get('LITDB_BACKEND', 'sqlite').lower()
+    if backend == 'postgresql':
+        # PostgreSQL uses RETURNING to get the new ID
+        cursor = db.execute("""
+            INSERT INTO research_sessions (question, started_at)
+            VALUES (?, ?)
+            RETURNING id
+        """, (args.question, datetime.now().isoformat()))
+        row = db.fetchone(cursor)
+        session_id = row['id'] if row else 0
+    else:
+        cursor = db.execute("""
+            INSERT INTO research_sessions (question, started_at)
+            VALUES (?, ?)
+        """, (args.question, datetime.now().isoformat()))
+        session_id = db.lastrowid(cursor)
 
-    session_id = cursor.lastrowid
+    db.commit()
     print(f"Created session {session_id}: {args.question}")
     return 0
 
 
 def session_list(args):
     """List research sessions."""
-    conn = get_db()
+    db = get_db()
 
-    rows = conn.execute("""
+    cursor = db.execute("""
         SELECT s.*,
                (SELECT COUNT(*) FROM session_papers WHERE session_id = s.id) as paper_count
         FROM research_sessions s
         ORDER BY started_at DESC
         LIMIT ?
-    """, (args.limit or 20,)).fetchall()
+    """, (args.limit or 20,))
+    rows = db.fetchall(cursor)
 
     if args.format == 'json':
-        print(json.dumps([dict(r) for r in rows], indent=2))
+        print(json.dumps(rows, indent=2, default=str))
     else:
         for row in rows:
             status = "completed" if row['completed_at'] else "in progress"
@@ -424,9 +379,9 @@ def session_list(args):
 
 def session_complete(args):
     """Mark a session as complete."""
-    conn = get_db()
+    db = get_db()
 
-    conn.execute("""
+    db.execute("""
         UPDATE research_sessions
         SET completed_at = ?, summary = ?, consensus_score = ?
         WHERE id = ?
@@ -436,27 +391,41 @@ def session_complete(args):
         args.consensus_score,
         args.id
     ))
-    conn.commit()
+    db.commit()
     print(f"Completed session {args.id}")
     return 0
 
 
 def session_add_paper(args):
     """Add a paper to a session."""
-    conn = get_db()
+    db = get_db()
 
-    conn.execute("""
-        INSERT OR REPLACE INTO session_papers
-        (session_id, bibcode, relevance_score, is_seed_paper, depth)
-        VALUES (?, ?, ?, ?, ?)
-    """, (
+    backend = os.environ.get('LITDB_BACKEND', 'sqlite').lower()
+    if backend == 'postgresql':
+        query = """
+            INSERT INTO session_papers
+            (session_id, bibcode, relevance_score, is_seed_paper, depth)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (session_id, bibcode) DO UPDATE SET
+                relevance_score = EXCLUDED.relevance_score,
+                is_seed_paper = EXCLUDED.is_seed_paper,
+                depth = EXCLUDED.depth
+        """
+    else:
+        query = """
+            INSERT OR REPLACE INTO session_papers
+            (session_id, bibcode, relevance_score, is_seed_paper, depth)
+            VALUES (?, ?, ?, ?, ?)
+        """
+
+    db.execute(query, (
         args.session_id,
         args.bibcode,
         args.relevance,
         args.seed,
         args.depth or 0
     ))
-    conn.commit()
+    db.commit()
     print(f"Added {args.bibcode} to session {args.session_id}")
     return 0
 
@@ -467,30 +436,52 @@ def session_add_paper(args):
 
 def hypothesis_add(args):
     """Add a hypothesis to track."""
-    conn = get_db()
+    db = get_db()
 
-    cursor = conn.execute("""
-        INSERT INTO hypotheses
-        (name, description, status, originating_bibcode, ruling_bibcode,
-         ruled_out_reason, superseded_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        args.name,
-        args.description,
-        args.status,
-        args.origin,
-        args.ruling,
-        args.reason,
-        args.superseded_by
-    ))
-    conn.commit()
-    print(f"Added hypothesis [{cursor.lastrowid}]: {args.name} ({args.status})")
+    backend = os.environ.get('LITDB_BACKEND', 'sqlite').lower()
+    if backend == 'postgresql':
+        cursor = db.execute("""
+            INSERT INTO hypotheses
+            (name, description, status, originating_bibcode, ruling_bibcode,
+             ruled_out_reason, superseded_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+        """, (
+            args.name,
+            args.description,
+            args.status,
+            args.origin,
+            args.ruling,
+            args.reason,
+            args.superseded_by
+        ))
+        row = db.fetchone(cursor)
+        hypothesis_id = row['id'] if row else 0
+    else:
+        cursor = db.execute("""
+            INSERT INTO hypotheses
+            (name, description, status, originating_bibcode, ruling_bibcode,
+             ruled_out_reason, superseded_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            args.name,
+            args.description,
+            args.status,
+            args.origin,
+            args.ruling,
+            args.reason,
+            args.superseded_by
+        ))
+        hypothesis_id = db.lastrowid(cursor)
+
+    db.commit()
+    print(f"Added hypothesis [{hypothesis_id}]: {args.name} ({args.status})")
     return 0
 
 
 def hypothesis_list(args):
     """List hypotheses."""
-    conn = get_db()
+    db = get_db()
 
     query = "SELECT * FROM hypotheses"
     params = []
@@ -501,10 +492,11 @@ def hypothesis_list(args):
 
     query += " ORDER BY updated_at DESC"
 
-    rows = conn.execute(query, params).fetchall()
+    cursor = db.execute(query, tuple(params))
+    rows = db.fetchall(cursor)
 
     if args.format == 'json':
-        print(json.dumps([dict(r) for r in rows], indent=2))
+        print(json.dumps(rows, indent=2, default=str))
     else:
         if not rows:
             print("No hypotheses tracked yet.")
@@ -530,7 +522,7 @@ def hypothesis_list(args):
 
 def hypothesis_update(args):
     """Update a hypothesis."""
-    conn = get_db()
+    db = get_db()
 
     updates = ["updated_at = ?"]
     params = [datetime.now().isoformat()]
@@ -550,44 +542,57 @@ def hypothesis_update(args):
 
     params.append(args.id)
 
-    conn.execute(f"""
+    db.execute(f"""
         UPDATE hypotheses
         SET {', '.join(updates)}
         WHERE id = ?
-    """, params)
-    conn.commit()
+    """, tuple(params))
+    db.commit()
     print(f"Updated hypothesis {args.id}")
     return 0
 
 
 def hypothesis_link(args):
     """Link a paper to a hypothesis."""
-    conn = get_db()
+    db = get_db()
 
-    conn.execute("""
-        INSERT OR REPLACE INTO hypothesis_papers
-        (hypothesis_id, bibcode, stance)
-        VALUES (?, ?, ?)
-    """, (args.hypothesis_id, args.bibcode, args.stance))
-    conn.commit()
+    backend = os.environ.get('LITDB_BACKEND', 'sqlite').lower()
+    if backend == 'postgresql':
+        query = """
+            INSERT INTO hypothesis_papers
+            (hypothesis_id, bibcode, stance)
+            VALUES (?, ?, ?)
+            ON CONFLICT (hypothesis_id, bibcode) DO UPDATE SET
+                stance = EXCLUDED.stance
+        """
+    else:
+        query = """
+            INSERT OR REPLACE INTO hypothesis_papers
+            (hypothesis_id, bibcode, stance)
+            VALUES (?, ?, ?)
+        """
+
+    db.execute(query, (args.hypothesis_id, args.bibcode, args.stance))
+    db.commit()
     print(f"Linked {args.bibcode} to hypothesis {args.hypothesis_id} ({args.stance})")
     return 0
 
 
 def hypothesis_ruled_out(args):
     """List ruled-out hypotheses with details."""
-    conn = get_db()
+    db = get_db()
 
-    rows = conn.execute("""
+    cursor = db.execute("""
         SELECT h.*, p.title as ruling_paper_title
         FROM hypotheses h
         LEFT JOIN papers p ON h.ruling_bibcode = p.bibcode
         WHERE h.status IN ('RULED_OUT', 'SUPERSEDED')
         ORDER BY h.updated_at DESC
-    """).fetchall()
+    """)
+    rows = db.fetchall(cursor)
 
     if args.format == 'json':
-        print(json.dumps([dict(r) for r in rows], indent=2))
+        print(json.dumps(rows, indent=2, default=str))
     else:
         if not rows:
             print("No ruled-out hypotheses yet.")
@@ -598,7 +603,7 @@ def hypothesis_ruled_out(args):
         print("=" * 60)
 
         for row in rows:
-            print(f"\n✗ {row['name']}")
+            print(f"\n* {row['name']}")
             print(f"  Status: {row['status']}")
             if row['description']:
                 print(f"  Description: {row['description']}")
@@ -618,7 +623,7 @@ def hypothesis_ruled_out(args):
 
 def export_data(args):
     """Export database data."""
-    conn = get_db()
+    db = get_db()
 
     data = {
         'exported_at': datetime.now().isoformat(),
@@ -628,10 +633,11 @@ def export_data(args):
 
     if args.session_id:
         # Export specific session
-        session = conn.execute(
+        cursor = db.execute(
             "SELECT * FROM research_sessions WHERE id = ?",
             (args.session_id,)
-        ).fetchone()
+        )
+        session = db.fetchone(cursor)
 
         if not session:
             print(f"Session {args.session_id} not found", file=sys.stderr)
@@ -640,36 +646,37 @@ def export_data(args):
         data['session'] = dict(session)
 
         # Get session papers
-        bibcodes = conn.execute(
+        cursor = db.execute(
             "SELECT bibcode FROM session_papers WHERE session_id = ?",
             (args.session_id,)
-        ).fetchall()
+        )
+        bibcodes = db.fetchall(cursor)
         bibcode_list = [r['bibcode'] for r in bibcodes]
 
         if bibcode_list:
             placeholders = ','.join('?' * len(bibcode_list))
-            papers = conn.execute(
+            cursor = db.execute(
                 f"SELECT * FROM papers WHERE bibcode IN ({placeholders})",
-                bibcode_list
-            ).fetchall()
-            data['papers'] = [dict(r) for r in papers]
+                tuple(bibcode_list)
+            )
+            data['papers'] = db.fetchall(cursor)
 
-            citations = conn.execute(f"""
+            cursor = db.execute(f"""
                 SELECT * FROM citations
                 WHERE citing_bibcode IN ({placeholders})
                    OR cited_bibcode IN ({placeholders})
-            """, bibcode_list + bibcode_list).fetchall()
-            data['citations'] = [dict(r) for r in citations]
+            """, tuple(bibcode_list + bibcode_list))
+            data['citations'] = db.fetchall(cursor)
     else:
         # Export all
-        papers = conn.execute("SELECT * FROM papers").fetchall()
-        data['papers'] = [dict(r) for r in papers]
+        cursor = db.execute("SELECT * FROM papers")
+        data['papers'] = db.fetchall(cursor)
 
-        citations = conn.execute("SELECT * FROM citations").fetchall()
-        data['citations'] = [dict(r) for r in citations]
+        cursor = db.execute("SELECT * FROM citations")
+        data['citations'] = db.fetchall(cursor)
 
     if args.format == 'json':
-        output = json.dumps(data, indent=2)
+        output = json.dumps(data, indent=2, default=str)
     else:
         # CSV format - just citations
         lines = ['citing_bibcode,cited_bibcode,classification,confidence']
@@ -688,17 +695,24 @@ def export_data(args):
 
 def show_stats(args):
     """Show database statistics."""
-    conn = get_db()
+    db = get_db()
 
-    paper_count = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-    citation_count = conn.execute("SELECT COUNT(*) FROM citations").fetchone()[0]
-    session_count = conn.execute("SELECT COUNT(*) FROM research_sessions").fetchone()[0]
-    hypothesis_count = conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone()[0]
+    cursor = db.execute("SELECT COUNT(*) as cnt FROM papers")
+    paper_count = db.fetchone(cursor)['cnt']
+
+    cursor = db.execute("SELECT COUNT(*) as cnt FROM citations")
+    citation_count = db.fetchone(cursor)['cnt']
+
+    cursor = db.execute("SELECT COUNT(*) as cnt FROM research_sessions")
+    session_count = db.fetchone(cursor)['cnt']
+
+    cursor = db.execute("SELECT COUNT(*) as cnt FROM hypotheses")
+    hypothesis_count = db.fetchone(cursor)['cnt']
 
     print("=" * 50)
     print("LITERATURE DATABASE STATISTICS")
     print("=" * 50)
-    print(f"Database: {DB_PATH}")
+    print(f"Database: {db.get_db_path()}")
     print(f"Papers: {paper_count}")
     print(f"Citations: {citation_count}")
     print(f"Hypotheses: {hypothesis_count}")
@@ -706,45 +720,50 @@ def show_stats(args):
 
     if citation_count > 0:
         print("\nCitation breakdown:")
-        rows = conn.execute("""
+        cursor = db.execute("""
             SELECT classification, COUNT(*) as count
             FROM citations
             GROUP BY classification
             ORDER BY count DESC
-        """).fetchall()
+        """)
+        rows = db.fetchall(cursor)
         for row in rows:
-            marker = " ⚠️" if row['classification'] == 'REFUTING' else ""
+            marker = " [!]" if row['classification'] == 'REFUTING' else ""
             print(f"  {row['classification']:15} {row['count']}{marker}")
 
     if hypothesis_count > 0:
         print("\nHypothesis status:")
-        rows = conn.execute("""
+        cursor = db.execute("""
             SELECT status, COUNT(*) as count
             FROM hypotheses
             GROUP BY status
-        """).fetchall()
+        """)
+        rows = db.fetchall(cursor)
         for row in rows:
-            icon = {'ACTIVE': '✓', 'RULED_OUT': '✗', 'SUPERSEDED': '→', 'UNCERTAIN': '?'}.get(row['status'], '')
+            icon = {'ACTIVE': '+', 'RULED_OUT': 'x', 'SUPERSEDED': '>', 'UNCERTAIN': '?'}.get(row['status'], '')
             print(f"  {icon} {row['status']:15} {row['count']}")
 
     if paper_count > 0:
         print("\nTop cited papers in database:")
-        rows = conn.execute("""
+        cursor = db.execute("""
             SELECT bibcode, title, citation_count
             FROM papers
             ORDER BY citation_count DESC
             LIMIT 5
-        """).fetchall()
+        """)
+        rows = db.fetchall(cursor)
         for row in rows:
             title = row['title'][:40] + '...' if row['title'] and len(row['title']) > 40 else row['title']
-            print(f"  [{row['citation_count']:4}] {title}")
+            ccount = row['citation_count'] or 0
+            print(f"  [{ccount:4}] {title}")
 
     # Show ruled out hypotheses summary
-    ruled_out = conn.execute("""
-        SELECT COUNT(*) FROM hypotheses WHERE status = 'RULED_OUT'
-    """).fetchone()[0]
+    cursor = db.execute("""
+        SELECT COUNT(*) as cnt FROM hypotheses WHERE status = 'RULED_OUT'
+    """)
+    ruled_out = db.fetchone(cursor)['cnt']
     if ruled_out > 0:
-        print(f"\n⚠️  {ruled_out} hypothesis(es) have been RULED OUT")
+        print(f"\n[!] {ruled_out} hypothesis(es) have been RULED OUT")
         print("   Run: litdb.py hypothesis ruled-out")
 
     return 0
@@ -752,15 +771,32 @@ def show_stats(args):
 
 def reset_db(args):
     """Reset (delete) the database."""
+    from db_backend import SQLITE_DB_PATH
+
+    backend = os.environ.get('LITDB_BACKEND', 'sqlite').lower()
+
     if not args.confirm:
         print("Use --confirm to actually delete the database", file=sys.stderr)
         return 1
 
-    if DB_PATH.exists():
-        DB_PATH.unlink()
-        print(f"Deleted database: {DB_PATH}")
+    if backend == 'postgresql':
+        # For PostgreSQL, drop all tables
+        db = get_db()
+        tables = ['session_papers', 'hypothesis_papers', 'citations',
+                  'hypotheses', 'research_sessions', 'papers']
+        for table in tables:
+            try:
+                db.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+            except Exception:
+                pass
+        db.commit()
+        print(f"Dropped all tables in PostgreSQL database")
     else:
-        print("Database does not exist")
+        if SQLITE_DB_PATH.exists():
+            SQLITE_DB_PATH.unlink()
+            print(f"Deleted database: {SQLITE_DB_PATH}")
+        else:
+            print("Database does not exist")
     return 0
 
 

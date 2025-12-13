@@ -3,8 +3,11 @@
 Citation Context Classifier
 
 Analyzes citation contexts to classify the relationship between citing
-and cited papers. Uses heuristics based on abstract analysis when full
-text is not available.
+and cited papers. Uses LLM-based classification for accurate understanding
+of nuanced scientific language.
+
+Classification is performed by gpt-4.1-mini by default, with regex-based
+fallback when LLM is unavailable or explicitly disabled.
 
 Citation Types:
 - SUPPORTING: Agrees with, builds upon, confirms, or validates the cited work
@@ -14,23 +17,130 @@ Citation Types:
 - METHODOLOGICAL: References methods, data, tools, or techniques
 - NEUTRAL: Simple acknowledgment without clear stance
 
-TODO: Replace pattern-based classification with LLM classification.
-      The current regex patterns are a heuristic approximation. For more
-      accurate classification, each citation sentence should be sent to
-      an LLM with the context of both papers and asked to classify the
-      relationship. This would enable:
-      - Better understanding of nuanced language
-      - Detection of sarcasm or qualified statements
-      - Cross-referencing with paper content
-      - Confidence calibration based on reasoning
+Environment variables:
+  OPENAI_API_KEY: Required for LLM classification
+  LITDB_CLASSIFIER: "llm" (default) or "regex" to force regex-based classification
+  LITDB_CLASSIFIER_MODEL: Model to use (default: gpt-4.1-mini)
 """
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
+from typing import Tuple, List, Dict, Any, Optional
 
+
+# LLM Classification System Prompt
+CLASSIFICATION_SYSTEM_PROMPT = """You are an expert in analyzing scientific literature, particularly in astronomy and astrophysics. Your task is to classify the relationship between a citing paper and a cited paper based on their abstracts.
+
+Classification categories:
+- SUPPORTING: The citing paper agrees with, confirms, validates, builds upon, or extends the cited work's findings or conclusions.
+- CONTRASTING: The citing paper disagrees with, challenges, questions, or presents alternative interpretations to the cited work. There is tension but not definitive refutation.
+- REFUTING: The citing paper provides strong evidence that definitively rules out, disproves, or renders obsolete the cited work's hypothesis or conclusions. This includes statistical exclusions (e.g., "ruled out at 5σ"), experimental refutations, or clear demonstrations that a theory is no longer viable.
+- CONTEXTUAL: The citing paper references the cited work for background, historical context, general statements, or as a review without taking a stance.
+- METHODOLOGICAL: The citing paper references the cited work for its methods, data, tools, techniques, software, or observational data without commenting on its conclusions.
+- NEUTRAL: Simple acknowledgment or citation without any clear stance or relationship.
+
+Important distinctions:
+- REFUTING is stronger than CONTRASTING. REFUTING means the hypothesis/theory is ruled out; CONTRASTING means there is disagreement but the matter is not settled.
+- Be particularly careful to identify REFUTING cases, as these are critical for understanding scientific consensus.
+- Look for statistical language like "excluded at Xσ", "ruled out", "refuted", "no longer viable".
+
+Respond with a JSON object containing:
+- "classification": One of the six categories above
+- "confidence": A number between 0 and 1 indicating your confidence
+- "reasoning": A brief explanation of why you chose this classification"""
+
+
+def get_openai_client():
+    """Get OpenAI client, returns None if not available."""
+    try:
+        from openai import OpenAI
+        api_key = os.environ.get('OPENAI_API_KEY')
+        if not api_key:
+            return None
+        return OpenAI(api_key=api_key)
+    except ImportError:
+        return None
+
+
+def classify_with_llm(
+    citing_abstract: str,
+    cited_abstract: str,
+    cited_title: str,
+    model: str = None
+) -> Tuple[str, float, str]:
+    """
+    Classify citation relationship using LLM.
+
+    Returns tuple of (classification, confidence, reasoning)
+    """
+    client = get_openai_client()
+    if client is None:
+        raise RuntimeError("OpenAI client not available. Set OPENAI_API_KEY or use --classifier=regex")
+
+    model = model or os.environ.get('LITDB_CLASSIFIER_MODEL', 'gpt-4.1-mini')
+
+    user_prompt = f"""Analyze the relationship between these two papers:
+
+CITED PAPER:
+Title: {cited_title or "Unknown"}
+Abstract: {cited_abstract or "No abstract available"}
+
+CITING PAPER (the paper that cites the above):
+Abstract: {citing_abstract or "No abstract available"}
+
+Based on the citing paper's abstract, classify its relationship to the cited paper."""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": CLASSIFICATION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,  # Low temperature for consistent classification
+            max_tokens=500
+        )
+
+        content = response.choices[0].message.content
+
+        # Parse JSON response
+        # Handle potential markdown code blocks
+        if '```json' in content:
+            content = content.split('```json')[1].split('```')[0]
+        elif '```' in content:
+            content = content.split('```')[1].split('```')[0]
+
+        result = json.loads(content.strip())
+
+        classification = result.get('classification', 'NEUTRAL').upper()
+        confidence = float(result.get('confidence', 0.5))
+        reasoning = result.get('reasoning', 'LLM classification')
+
+        # Validate classification
+        valid_classifications = {'SUPPORTING', 'CONTRASTING', 'REFUTING',
+                                 'CONTEXTUAL', 'METHODOLOGICAL', 'NEUTRAL'}
+        if classification not in valid_classifications:
+            classification = 'NEUTRAL'
+            confidence = 0.3
+
+        return classification, min(confidence, 0.99), reasoning
+
+    except json.JSONDecodeError as e:
+        # If JSON parsing fails, try to extract classification from text
+        content = response.choices[0].message.content.upper()
+        for cat in ['REFUTING', 'SUPPORTING', 'CONTRASTING', 'METHODOLOGICAL', 'CONTEXTUAL', 'NEUTRAL']:
+            if cat in content:
+                return cat, 0.5, f"Extracted from non-JSON response: {content[:100]}"
+        return 'NEUTRAL', 0.3, f"Failed to parse LLM response: {str(e)}"
+    except Exception as e:
+        raise RuntimeError(f"LLM classification failed: {str(e)}")
+
+
+# Fallback regex patterns for when LLM is not available
 
 # Patterns indicating support for cited work
 SUPPORT_PATTERNS = [
@@ -190,14 +300,47 @@ def classify_by_patterns(text):
     return classification, min(confidence, 0.95), matched[classification]
 
 
-def analyze_abstract_relationship(citing_abstract, cited_abstract, cited_title):
+def get_classifier_mode() -> str:
+    """Get the classifier mode from environment."""
+    return os.environ.get('LITDB_CLASSIFIER', 'llm').lower()
+
+
+def analyze_abstract_relationship(
+    citing_abstract: str,
+    cited_abstract: str,
+    cited_title: str,
+    use_llm: bool = None
+) -> Tuple[str, float, str]:
     """
     Analyze the relationship between a citing paper and cited paper
     based on their abstracts.
+
+    Args:
+        citing_abstract: Abstract of the citing paper
+        cited_abstract: Abstract of the cited paper
+        cited_title: Title of the cited paper
+        use_llm: Whether to use LLM classification (default: from environment)
+
+    Returns:
+        Tuple of (classification, confidence, reasoning)
     """
     if not citing_abstract:
         return 'NEUTRAL', 0.0, "No citing abstract available"
 
+    # Determine whether to use LLM
+    if use_llm is None:
+        use_llm = get_classifier_mode() == 'llm'
+
+    if use_llm:
+        try:
+            return classify_with_llm(citing_abstract, cited_abstract, cited_title)
+        except RuntimeError as e:
+            # Fall back to regex if LLM fails
+            print(f"Warning: LLM classification failed, falling back to regex: {e}",
+                  file=sys.stderr)
+            # Fall through to regex classification
+
+    # Regex-based classification (fallback)
     # Check if cited paper's title/topic appears in citing abstract
     title_words = set(cited_title.lower().split()) if cited_title else set()
     common_stopwords = {'the', 'a', 'an', 'of', 'in', 'on', 'for', 'to', 'and', 'with'}
@@ -210,6 +353,7 @@ def analyze_abstract_relationship(citing_abstract, cited_abstract, cited_title):
     classification, confidence, patterns = classify_by_patterns(citing_abstract)
 
     reasoning = []
+    reasoning.append("(regex fallback)")
     if patterns:
         reasoning.append(f"Matched patterns: {len(patterns)}")
     if overlap:
@@ -330,6 +474,12 @@ Examples:
   %(prog)s --input citations.json
   %(prog)s --input network.json --output classified.json
   %(prog)s --citing-abstract "We confirm the findings of..." --cited-title "Dark matter study"
+  %(prog)s --classifier regex --input citations.json  # Force regex-based classification
+
+Environment variables:
+  OPENAI_API_KEY: Required for LLM classification
+  LITDB_CLASSIFIER: "llm" (default) or "regex"
+  LITDB_CLASSIFIER_MODEL: Model to use (default: gpt-4.1-mini)
         """
     )
 
@@ -337,21 +487,51 @@ Examples:
                         help='JSON file with citation network (from citation_analysis.py)')
     parser.add_argument('--citing-abstract',
                         help='Abstract of citing paper (for single classification)')
+    parser.add_argument('--cited-abstract',
+                        help='Abstract of cited paper (for single classification with LLM)')
     parser.add_argument('--cited-title',
                         help='Title of cited paper (for single classification)')
     parser.add_argument('--output', '-o', help='Output file (default: stdout)')
     parser.add_argument('--format', '-f', choices=['json', 'summary'],
                         default='summary', help='Output format')
+    parser.add_argument('--classifier', '-c', choices=['llm', 'regex'],
+                        default=None,
+                        help='Classifier to use (default: from LITDB_CLASSIFIER env, or "llm")')
+    parser.add_argument('--model', '-m',
+                        help='LLM model to use (default: gpt-5.1-mini)')
 
     args = parser.parse_args()
 
+    # Set classifier mode from argument if provided
+    if args.classifier:
+        os.environ['LITDB_CLASSIFIER'] = args.classifier
+    if args.model:
+        os.environ['LITDB_CLASSIFIER_MODEL'] = args.model
+
     # Single classification mode
     if args.citing_abstract:
-        classification, confidence, reasoning = classify_by_patterns(args.citing_abstract)
+        use_llm = get_classifier_mode() == 'llm'
+
+        if use_llm:
+            try:
+                classification, confidence, reasoning = classify_with_llm(
+                    args.citing_abstract,
+                    args.cited_abstract or "",
+                    args.cited_title or ""
+                )
+            except RuntimeError as e:
+                print(f"LLM classification failed: {e}", file=sys.stderr)
+                print("Falling back to regex classification...", file=sys.stderr)
+                classification, confidence, reasoning = classify_by_patterns(args.citing_abstract)
+                reasoning = reasoning if reasoning else []
+        else:
+            classification, confidence, reasoning = classify_by_patterns(args.citing_abstract)
+
         result = {
             'classification': classification,
             'confidence': confidence,
-            'reasoning': reasoning if reasoning else 'No strong signals detected'
+            'reasoning': reasoning if reasoning else 'No strong signals detected',
+            'classifier': 'llm' if use_llm else 'regex'
         }
         print(json.dumps(result, indent=2))
         return
