@@ -121,11 +121,41 @@ uv run .claude/skills/astro-literature/scripts/litdb.py session create \
 ```
 
 ### Step 3: Search ADS for Seed Papers
+
+**Standard query:**
 ```bash
 uv run .claude/skills/astro-literature/scripts/ads_search.py \
     --query 'abstract:"dark matter halo" year:2020-2024 property:refereed' \
     --rows 20 --format json
 ```
+
+**Enhanced search modes (recommended for comprehensive reviews):**
+
+```bash
+# Find review articles on the topic (ARA&A, Space Science Reviews, etc.)
+uv run .claude/skills/astro-literature/scripts/ads_search.py \
+    --reviews "protoplanet accretion" --year-start 2018 --rows 10
+
+# Find trending papers (getting unusual recent attention)
+uv run .claude/skills/astro-literature/scripts/ads_search.py \
+    --trending "planet formation" --rows 15
+
+# Find papers marked as useful by ADS readers
+uv run .claude/skills/astro-literature/scripts/ads_search.py \
+    --useful "disk accretion" --rows 15
+
+# Search telescope proposals to see the "zeitgeist" (what's fundable now)
+uv run .claude/skills/astro-literature/scripts/ads_search.py \
+    --proposals --telescope jwst --topic "protoplanet" --year-start 2023 --rows 10
+
+# Available telescopes: hst, jwst, alma, chandra, xmm, spitzer
+```
+
+**Recommended seed paper strategy:**
+1. Start with recent review articles (--reviews)
+2. Add trending papers for current developments (--trending)
+3. Check telescope proposals for the zeitgeist (--proposals)
+4. Fill gaps with targeted queries (--query)
 
 ### Step 4: Spawn Paper Analysis Subagents
 

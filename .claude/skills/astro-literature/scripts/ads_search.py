@@ -128,6 +128,95 @@ def get_references(bibcode, rows=100):
     return search_papers(query, rows=rows, sort='citation_count desc')
 
 
+def get_trending(topic=None, rows=20):
+    """
+    Get trending papers - papers getting unusual attention recently.
+
+    The trending() operator finds papers with recent citation activity
+    that exceeds expectations based on their age and field.
+    """
+    if topic:
+        query = f"trending({topic})"
+    else:
+        query = "trending()"
+    return search_papers(query, rows=rows, sort='score desc')
+
+
+def get_useful(topic=None, rows=20):
+    """
+    Get papers marked as 'useful' by ADS readers.
+
+    The useful() operator finds papers that users have marked as useful,
+    which can surface important papers that citations alone might miss.
+    """
+    if topic:
+        query = f"useful({topic})"
+    else:
+        query = "useful()"
+    return search_papers(query, rows=rows, sort='score desc')
+
+
+def get_reviews(topic=None, rows=20, year_start=None):
+    """
+    Get review articles on a topic.
+
+    Searches Annual Review of Astronomy & Astrophysics (ARA&A),
+    Space Science Reviews, and other review publications.
+    """
+    # Review journal bibstems and doctype
+    review_filter = '(bibstem:"ARA&A" OR bibstem:"SSRv" OR bibstem:"AREPS" OR bibstem:"RvMP" OR doctype:review)'
+
+    if topic:
+        query = f'({topic}) AND {review_filter}'
+    else:
+        query = review_filter
+
+    if year_start:
+        query += f" year:{year_start}-"
+
+    return search_papers(query, rows=rows, sort='citation_count desc')
+
+
+def get_proposals(telescope=None, topic=None, rows=20, year_start=None):
+    """
+    Get telescope observing proposals (abstracts are public on ADS).
+
+    This surfaces the 'zeitgeist' - what topics are fundable and
+    observationally tractable right now.
+
+    Args:
+        telescope: 'hst', 'jwst', 'alma', 'chandra', or None for all
+        topic: Optional topic to filter by
+        rows: Number of results
+        year_start: Start year filter
+    """
+    # Proposal bibstems by telescope
+    telescope_bibstems = {
+        'hst': 'hst..prop',
+        'jwst': 'jwst.prop',
+        'alma': 'alma.prop',
+        'chandra': 'cxo..prop',
+        'xmm': 'xmm..prop',
+        'spitzer': 'sptz.prop',
+    }
+
+    if telescope and telescope.lower() in telescope_bibstems:
+        bibstem = telescope_bibstems[telescope.lower()]
+        query = f'bibstem:"{bibstem}"'
+    else:
+        # All major space telescope proposals
+        all_props = ' OR '.join(f'bibstem:"{bs}"' for bs in telescope_bibstems.values())
+        query = f'({all_props})'
+
+    if topic:
+        query = f'({topic}) AND {query}'
+
+    if year_start:
+        query += f" year:{year_start}-"
+
+    return search_papers(query, rows=rows, sort='date desc')
+
+
 def format_output(results, format_type='json'):
     """Format results for output."""
     if format_type == 'json':
@@ -171,12 +260,26 @@ Examples:
   %(prog)s --query 'title:"gravitational waves"' --refereed
   %(prog)s --citations 2019ApJ...882L...2S
   %(prog)s --references 2021ApJ...919..138Z
+  %(prog)s --trending "protoplanetary disk"
+  %(prog)s --reviews "planet formation" --year-start 2020
+  %(prog)s --proposals --telescope jwst --topic "protoplanet"
         """
     )
 
     parser.add_argument('--query', '-q', help='ADS search query')
     parser.add_argument('--citations', help='Get papers citing this bibcode')
     parser.add_argument('--references', help='Get papers referenced by this bibcode')
+    parser.add_argument('--trending', nargs='?', const='', metavar='TOPIC',
+                        help='Get trending papers (optionally filtered by topic)')
+    parser.add_argument('--useful', nargs='?', const='', metavar='TOPIC',
+                        help='Get papers marked useful by readers')
+    parser.add_argument('--reviews', nargs='?', const='', metavar='TOPIC',
+                        help='Get review articles (ARA&A, SSRv, etc.)')
+    parser.add_argument('--proposals', action='store_true',
+                        help='Search telescope observing proposals')
+    parser.add_argument('--telescope', choices=['hst', 'jwst', 'alma', 'chandra', 'xmm', 'spitzer'],
+                        help='Filter proposals by telescope')
+    parser.add_argument('--topic', help='Topic filter for proposals/trending/reviews')
     parser.add_argument('--rows', '-n', type=int, default=20,
                         help='Number of results (default: 20, max: 2000)')
     parser.add_argument('--sort', '-s', default='citation_count desc',
@@ -199,15 +302,34 @@ Examples:
               file=sys.stderr)
         sys.exit(1)
 
-    # Must provide one of query, citations, or references
-    if not any([args.query, args.citations, args.references]):
-        parser.error("One of --query, --citations, or --references is required")
+    # Must provide one of the search modes
+    search_modes = [args.query, args.citations, args.references,
+                    args.trending is not None, args.useful is not None,
+                    args.reviews is not None, args.proposals]
+    if not any(search_modes):
+        parser.error("One of --query, --citations, --references, --trending, --useful, --reviews, or --proposals is required")
 
     # Execute search
     if args.citations:
         results = get_citations(args.citations, args.rows)
     elif args.references:
         results = get_references(args.references, args.rows)
+    elif args.trending is not None:
+        topic = args.trending or args.topic
+        results = get_trending(topic=topic, rows=args.rows)
+    elif args.useful is not None:
+        topic = args.useful or args.topic
+        results = get_useful(topic=topic, rows=args.rows)
+    elif args.reviews is not None:
+        topic = args.reviews or args.topic
+        results = get_reviews(topic=topic, rows=args.rows, year_start=args.year_start)
+    elif args.proposals:
+        results = get_proposals(
+            telescope=args.telescope,
+            topic=args.topic,
+            rows=args.rows,
+            year_start=args.year_start
+        )
     else:
         results = search_papers(
             args.query,
